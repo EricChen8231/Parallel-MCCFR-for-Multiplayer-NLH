@@ -616,17 +616,22 @@ void kernel_simulate_batch(
     curandStatePhilox4_32_10_t* __restrict__ rng_states,
     float*                                   regrets,
     float*                                   strategy_sum,
-    const __nv_bfloat16* __restrict__        strategy,   // BF16
+    const __nv_bfloat16* __restrict__        strategy,        // BF16
     float*                                   ev_baseline,
     int num_games,
-    int update_player,
+    const int*       __restrict__ update_player_ptr,  // device scalar (graph-safe)
     int num_players,
     int starting_stack,
     int sb, int bb,
-    long long iteration,
+    const long long* __restrict__ iteration_ptr,      // device scalar (graph-safe)
     int table_size)
 {
     // -----------------------------------------------------------------------
+    // Dereference device-side scalars set by host before each launch/graph replay.
+    // Placing these in registers at the top avoids repeated global loads.
+    const int       update_player = *update_player_ptr;
+    const long long iteration     = *iteration_ptr;
+
     // Shared-memory combining buffer (256 slots = one per thread in block).
     // sc_keys[s]           — info_set index occupying slot s (COMB_EMPTY = free)
     // sc_rd[a*SLOTS + s]   — accumulated regret delta for action a at slot s
@@ -841,6 +846,15 @@ void GPUCFRTrainer::alloc_device_buffers(int batch_size)
     CUDA_CHECK(cudaMemset(d_strategy,     0, bf16_bytes));
     CUDA_CHECK(cudaMemset(d_ev_baseline,  0, base_bytes));
 
+    // Device-side scalars for CUDA Graph replay.
+    // The graph captures fixed pointer arguments; update these before each launch.
+    CUDA_CHECK(cudaMalloc(&d_iter_counter,   sizeof(long long)));
+    CUDA_CHECK(cudaMalloc(&d_player_counter, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_iter_counter,   0, sizeof(long long)));
+    CUDA_CHECK(cudaMemset(d_player_counter, 0, sizeof(int)));
+
+    batch_size_ = batch_size;
+
     printf("GPU buffers:  regrets=%.1f MB  ssum=%.1f MB  strategy(BF16)=%.1f MB  baseline=%.1f MB\n",
            fp32_bytes/1e6, fp32_bytes/1e6, bf16_bytes/1e6, base_bytes/1e6);
     printf("  Total: %.1f MB (vs %.1f MB all-FP32)\n",
@@ -850,12 +864,14 @@ void GPUCFRTrainer::alloc_device_buffers(int batch_size)
 
 void GPUCFRTrainer::free_device_buffers()
 {
-    if (d_regrets)      { cudaFree(d_regrets);      d_regrets      = nullptr; }
-    if (d_strategy_sum) { cudaFree(d_strategy_sum); d_strategy_sum = nullptr; }
-    if (d_strategy)     { cudaFree(d_strategy);     d_strategy     = nullptr; }
-    if (d_ev_baseline)  { cudaFree(d_ev_baseline);  d_ev_baseline  = nullptr; }
-    if (d_rng_states)   { cudaFree(d_rng_states);   d_rng_states   = nullptr; }
-    if (d_hr_table)     { cudaFree(d_hr_table);     d_hr_table     = nullptr; }
+    if (d_regrets)        { cudaFree(d_regrets);        d_regrets        = nullptr; }
+    if (d_strategy_sum)   { cudaFree(d_strategy_sum);   d_strategy_sum   = nullptr; }
+    if (d_strategy)       { cudaFree(d_strategy);       d_strategy       = nullptr; }
+    if (d_ev_baseline)    { cudaFree(d_ev_baseline);    d_ev_baseline    = nullptr; }
+    if (d_iter_counter)   { cudaFree(d_iter_counter);   d_iter_counter   = nullptr; }
+    if (d_player_counter) { cudaFree(d_player_counter); d_player_counter = nullptr; }
+    if (d_rng_states)     { cudaFree(d_rng_states);     d_rng_states     = nullptr; }
+    if (d_hr_table)       { cudaFree(d_hr_table);       d_hr_table       = nullptr; }
 }
 
 void GPUCFRTrainer::init_rng(int batch_size, unsigned long long seed)
@@ -890,8 +906,10 @@ void GPUCFRTrainer::run_regret_matching()
         d_regrets, d_strategy, GPU_TABLE_SIZE);
 }
 
-void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
-                                          long long iteration)
+// Launches only the simulation kernel; safe to record in a CUDA Graph because
+// all changing values (player, iteration) are read from d_player_counter /
+// d_iter_counter at kernel execution time — the captured pointer args are stable.
+void GPUCFRTrainer::launch_sim_kernel(int batch_size)
 {
     int blocks = (batch_size + GPU_BLOCK_SIZE - 1) / GPU_BLOCK_SIZE;
     kernel_simulate_batch<<<blocks, GPU_BLOCK_SIZE, 0, compute_stream_>>>(
@@ -900,10 +918,23 @@ void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
         d_strategy,           // BF16
         d_ev_baseline,
         batch_size,
-        update_player,
+        d_player_counter,     // device pointer — graph-safe
         N_, stack_, sb_, bb_,
-        iteration,
+        d_iter_counter,       // device pointer — graph-safe
         GPU_TABLE_SIZE);
+}
+
+// Updates the device-side counters on compute_stream_ then launches the kernel.
+// The async memcpys are ordered before the kernel on the same stream, so the
+// kernel sees the correct values.  This path is NOT called during graph capture.
+void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
+                                          long long iteration)
+{
+    CUDA_CHECK(cudaMemcpyAsync(d_player_counter, &update_player,
+                               sizeof(int),       cudaMemcpyHostToDevice, compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &iteration,
+                               sizeof(long long), cudaMemcpyHostToDevice, compute_stream_));
+    launch_sim_kernel(batch_size);
 }
 
 void GPUCFRTrainer::run_cfr_plus_clamp()
@@ -939,31 +970,76 @@ void GPUCFRTrainer::allreduce_tables()
 // =============================================================================
 void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbose)
 {
-    alloc_device_buffers(batch_size);
+    // Only allocate + zero-init if not already done (e.g. by load_checkpoint).
+    // Skipping alloc here preserves checkpoint data already in device memory.
+    if (!d_regrets) alloc_device_buffers(batch_size);
     init_rng(batch_size);
     upload_preflop_lut();
 
-    // traverse_gpu recurses up to ~30 levels; new frame includes comb buffer ptrs
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 10240));
+    // traverse_gpu can recurse ~30+ levels; each frame holds a ~224-byte ThreadGame
+    // copy plus local vars (~600 bytes/frame).  16 kB provides safe margin for
+    // 6-player games with multiple bet-rounds before reaching a terminal node.
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 16384));
 
     if (verbose)
         printf("Training: %lld iters, batch=%d, players=%d, CFR+=%s, LCFR=%s\n",
                total_iterations, batch_size, N_,
                cfr_plus_ ? "on" : "off", linear_cfr_ ? "on" : "off");
 
+    // -----------------------------------------------------------------------
+    // CUDA Graph capture
+    //
+    // Capture one player-update cycle: [regret_match → simulate → clamp].
+    // kernel_simulate_batch reads update_player and iteration via device
+    // pointers (d_player_counter / d_iter_counter), so the captured graph has
+    // stable pointer arguments.  Before each replay we push the current values
+    // with cudaMemcpyAsync on compute_stream_; same-stream ordering guarantees
+    // the kernel sees the updated scalars.
+    //
+    // Re-capture if batch_size changed (e.g. second train() call with new batch).
+    // -----------------------------------------------------------------------
+    if (graph_captured_ && batch_size != batch_size_) {
+        if (verbose) printf("Batch size changed (%d→%d); recapturing CUDA graph.\n",
+                            batch_size_, batch_size);
+        cudaGraphExecDestroy(graph_exec_); graph_exec_  = nullptr;
+        cudaGraphDestroy(cuda_graph_);     cuda_graph_  = nullptr;
+        graph_captured_ = false;
+        batch_size_     = batch_size;
+    }
+
+    if (!graph_captured_) {
+        // Capture: no work is executed during StreamBeginCapture…StreamEndCapture.
+        CUDA_CHECK(cudaStreamBeginCapture(compute_stream_,
+                                          cudaStreamCaptureModeGlobal));
+        run_regret_matching();
+        launch_sim_kernel(batch_size);
+        run_cfr_plus_clamp();
+        CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &cuda_graph_));
+        CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, cuda_graph_,
+                                        nullptr, nullptr, 0));
+        graph_captured_ = true;
+        batch_size_     = batch_size;
+        if (verbose) printf("CUDA Graph captured (3 kernels per player-update).\n");
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (long long iter = 1; iter <= total_iterations; iter++) {
-        // Alternating updates (CFR+): update each player in turn
+        // Alternating updates (CFR+): update each player in turn.
+        // For each player: push updated scalars, then replay the captured graph.
         for (int p = 0; p < N_; p++) {
-            // Step 1: Regret matching → BF16 strategy from current FP32 regrets
-            run_regret_matching();
+            // Update device-side scalars before graph replay.
+            // Both memcpys are on compute_stream_, so they complete before the
+            // graph kernels execute (same stream = ordered execution).
+            CUDA_CHECK(cudaMemcpyAsync(d_player_counter, &p,
+                                       sizeof(int),       cudaMemcpyHostToDevice,
+                                       compute_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &iter,
+                                       sizeof(long long), cudaMemcpyHostToDevice,
+                                       compute_stream_));
 
-            // Step 2: Simulate batch; combining buffer reduces global atomics
-            run_simulation_batch(batch_size, p, iter);
-
-            // Step 3: CFR+ — clamp negative regrets to zero
-            run_cfr_plus_clamp();
+            // Replay: [regret_match → simulate(p, iter) → clamp]
+            CUDA_CHECK(cudaGraphLaunch(graph_exec_, compute_stream_));
         }
 
         // Step 4 (multi-GPU): AllReduce regrets + strategy_sum via NCCL
@@ -1040,6 +1116,39 @@ int GPUCFRTrainer::num_info_sets_active() const
 }
 
 // =============================================================================
+// MPI table export / import
+//
+// export_tables() downloads the two FP32 arrays (regrets, strategy_sum) from
+// device to host so the caller can pass them to MPI_Allreduce(MPI_SUM).
+// import_tables() uploads the globally-reduced arrays back to the device.
+// The BF16 d_strategy cache is NOT synced here — run_regret_matching() on the
+// first training iteration will recompute it from the merged regrets.
+// =============================================================================
+void GPUCFRTrainer::export_tables(std::vector<float>& reg,
+                                   std::vector<float>& ssum) const
+{
+    size_t n = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE;
+    reg.resize(n);
+    ssum.resize(n);
+    CUDA_CHECK(cudaMemcpyAsync(reg.data(),  d_regrets,
+                               n * sizeof(float), cudaMemcpyDeviceToHost, transfer_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(ssum.data(), d_strategy_sum,
+                               n * sizeof(float), cudaMemcpyDeviceToHost, transfer_stream_));
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+}
+
+void GPUCFRTrainer::import_tables(const std::vector<float>& reg,
+                                   const std::vector<float>& ssum)
+{
+    size_t n = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE;
+    CUDA_CHECK(cudaMemcpyAsync(d_regrets,      reg.data(),
+                               n * sizeof(float), cudaMemcpyHostToDevice, transfer_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_strategy_sum, ssum.data(),
+                               n * sizeof(float), cudaMemcpyHostToDevice, transfer_stream_));
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+}
+
+// =============================================================================
 // Checkpoint save / load (uses async transfer stream)
 // =============================================================================
 bool GPUCFRTrainer::save_checkpoint(const std::string& path) const
@@ -1085,6 +1194,28 @@ bool GPUCFRTrainer::load_checkpoint(const std::string& path)
     f.read((char*)reg.data(),  n * sizeof(float));
     f.read((char*)ssum.data(), n * sizeof(float));
     if (!f) return false;
+
+    // Allocate device buffers if train() has not been called yet.
+    // d_regrets == nullptr means alloc_device_buffers() hasn't run.
+    // We allocate without zeroing regrets/strategy_sum — checkpoint data fills them.
+    // d_strategy and d_ev_baseline are zeroed; train() will recompute them on the
+    // first regret-matching pass.
+    if (!d_regrets) {
+        size_t fp32_bytes = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE * sizeof(float);
+        size_t bf16_bytes = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE * sizeof(__nv_bfloat16);
+        size_t base_bytes = (size_t)GPU_TABLE_SIZE  * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&d_regrets,      fp32_bytes));
+        CUDA_CHECK(cudaMalloc(&d_strategy_sum, fp32_bytes));
+        CUDA_CHECK(cudaMalloc(&d_strategy,     bf16_bytes));
+        CUDA_CHECK(cudaMalloc(&d_ev_baseline,  base_bytes));
+        CUDA_CHECK(cudaMemset(d_strategy,    0, bf16_bytes));
+        CUDA_CHECK(cudaMemset(d_ev_baseline, 0, base_bytes));
+        // Allocate the CUDA-Graph counter scalars too
+        CUDA_CHECK(cudaMalloc(&d_iter_counter,   sizeof(long long)));
+        CUDA_CHECK(cudaMalloc(&d_player_counter, sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_iter_counter,   0, sizeof(long long)));
+        CUDA_CHECK(cudaMemset(d_player_counter, 0, sizeof(int)));
+    }
 
     CUDA_CHECK(cudaMemcpy(d_regrets,      reg.data(),  n*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_strategy_sum, ssum.data(), n*sizeof(float), cudaMemcpyHostToDevice));

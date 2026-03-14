@@ -1,7 +1,8 @@
 #!/bin/bash
 # Quick build script for CARC (run this before sbatch)
 module purge
-module load cuda/12.2.0 gcc/11.3.0 openmpi/4.1.4 cmake/3.24.2
+module load ver/2506 gcc/14.3.0 openmpi/5.0.8 cmake/3.31.7 cuda/12.9.1
+export LD_LIBRARY_PATH=$(dirname $(which nvcc))/../lib64:$LD_LIBRARY_PATH
 
 mkdir -p build && cd build
 cmake .. \

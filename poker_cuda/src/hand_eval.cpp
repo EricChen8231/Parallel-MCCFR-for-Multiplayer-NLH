@@ -2,8 +2,6 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
-#include <stdexcept>
-#include <algorithm>
 #include <cassert>
 
 // ---------------------------------------------------------------------------
@@ -23,7 +21,7 @@ bool hand_eval_init(const char* path) {
 }
 
 // ---------------------------------------------------------------------------
-// Core 5-card evaluation (5 table lookups)
+// Core 5-card evaluation (5 sequential Two Plus Two lookups)
 // ---------------------------------------------------------------------------
 static inline uint16_t eval5(Card c0, Card c1, Card c2, Card c3, Card c4) {
     int p = HR[53 + c0 + 1];
@@ -34,6 +32,20 @@ static inline uint16_t eval5(Card c0, Card c1, Card c2, Card c3, Card c4) {
 }
 
 // ---------------------------------------------------------------------------
+// 6-card evaluation (6 sequential lookups — same entry point as eval5/eval7)
+// Best 5-card hand from exactly 6 cards; avoids the C(6,5)=6 brute-force.
+// ---------------------------------------------------------------------------
+static inline uint16_t eval6(Card c0, Card c1, Card c2,
+                              Card c3, Card c4, Card c5) {
+    int p = HR[53 + c0 + 1];
+    p = HR[p  + c1 + 1];
+    p = HR[p  + c2 + 1];
+    p = HR[p  + c3 + 1];
+    p = HR[p  + c4 + 1];
+    return (uint16_t)HR[p + c5 + 1];
+}
+
+// ---------------------------------------------------------------------------
 // 7-card: iterate all C(7,5)=21 five-card combos, return max rank
 // ---------------------------------------------------------------------------
 uint16_t evaluate_7cards(Card c0, Card c1, Card c2,
@@ -41,14 +53,14 @@ uint16_t evaluate_7cards(Card c0, Card c1, Card c2,
     Card hand[7] = {c0, c1, c2, c3, c4, c5, c6};
     uint16_t best = 0;
     // Generate all 21 combos of 5 from 7
-    for (int i = 0; i < 7 - 4; i++)
-    for (int j = i+1; j < 7 - 3; j++)
-    for (int k = j+1; k < 7 - 2; k++)
-    for (int l = k+1; l < 7 - 1; l++)
-    for (int m = l+1; m < 7;     m++) {
-        uint16_t v = eval5(hand[i], hand[j], hand[k], hand[l], hand[m]);
-        if (v > best) best = v;
-    }
+    for (int i = 0; i < 3; i++)
+      for (int j = i+1; j < 4; j++)
+        for (int k = j+1; k < 5; k++)
+          for (int l = k+1; l < 6; l++)
+            for (int m = l+1; m < 7; m++) {
+                uint16_t v = eval5(hand[i], hand[j], hand[k], hand[l], hand[m]);
+                if (v > best) best = v;
+            }
     return best;
 }
 
@@ -64,16 +76,11 @@ uint16_t evaluate_best(Card h0, Card h1,
             community[3], community[4]);
     }
     if (n_comm == 4) {
-        uint16_t best = 0;
-        for (int skip = 0; skip < 4; skip++) {
-            Card c[5];
-            int ci = 0;
-            c[ci++] = h0; c[ci++] = h1;
-            for (int i = 0; i < 4; i++) if (i != skip) c[ci++] = community[i];
-            uint16_t v = eval5(c[0], c[1], c[2], c[3], c[4]);
-            if (v > best) best = v;
-        }
-        return best;
+        // Best 5 from 6 cards (2 hole + 4 community) via sequential 6-card lookup.
+        // The old 4-combo loop skipped combinations where a hole card is excluded
+        // (e.g. using only 1 hole card + all 4 community), missing 2 of C(6,5)=6.
+        return eval6(h0, h1,
+                     community[0], community[1], community[2], community[3]);
     }
     if (n_comm == 3) {
         // Best 5 from 5 cards
@@ -107,14 +114,25 @@ void precompute_ranks(const Card* hole_cards,
 }
 
 const char* hand_category(uint16_t rank) {
-    if (rank > 6185) return "Royal Flush";
-    if (rank > 5853) return "Straight Flush";
-    if (rank > 5853 - 156) return "Four of a Kind";
-    if (rank > 5853 - 156 - 156) return "Full House";
-    if (rank > 1277 + 1135 + 858 + 858) return "Flush";
-    if (rank > 1277 + 1135 + 858) return "Straight";
-    if (rank > 1277 + 1135) return "Three of a Kind";
-    if (rank > 1277) return "Two Pair";
-    if (rank > 10) return "One Pair";
+    // Two Plus Two rank distribution [1..7462]:
+    //   High Card:        1 – 1277   (1277 ranks)
+    //   One Pair:      1278 – 4136   (2859 ranks)
+    //   Two Pair:      4137 – 4994   ( 858 ranks)
+    //   Three of a Kind: 4995 – 5852 ( 858 ranks)
+    //   Straight:      5853 – 5862   (  10 ranks)
+    //   Flush:         5863 – 7139   (1277 ranks)
+    //   Full House:    7140 – 7295   ( 156 ranks)
+    //   Four of a Kind:7296 – 7451   ( 156 ranks)
+    //   Straight Flush:7452 – 7461   (  10 ranks)
+    //   Royal Flush:         7462    (   1 rank)
+    if (rank >= 7462) return "Royal Flush";
+    if (rank >= 7452) return "Straight Flush";
+    if (rank >= 7296) return "Four of a Kind";
+    if (rank >= 7140) return "Full House";
+    if (rank >= 5863) return "Flush";
+    if (rank >= 5853) return "Straight";
+    if (rank >= 4995) return "Three of a Kind";
+    if (rank >= 4137) return "Two Pair";
+    if (rank >= 1278) return "One Pair";
     return "High Card";
 }

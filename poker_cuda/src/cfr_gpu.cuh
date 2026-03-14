@@ -66,6 +66,16 @@ public:
     bool load_checkpoint(const std::string& path);
     int  num_info_sets_active() const;
 
+    // Download regrets + strategy_sum to host vectors (for MPI AllReduce).
+    // Vectors are resized to GPU_NUM_ACTIONS * GPU_TABLE_SIZE floats each.
+    void export_tables(std::vector<float>& regrets,
+                       std::vector<float>& strategy_sum) const;
+
+    // Upload regrets + strategy_sum from host vectors back to device.
+    // Call after MPI_Allreduce to load the globally merged tables.
+    void import_tables(const std::vector<float>& regrets,
+                       const std::vector<float>& strategy_sum);
+
 #ifdef USE_NCCL
     // Call once before train() to enable multi-GPU AllReduce.
     void init_nccl(ncclComm_t comm) { nccl_comm_ = comm; }
@@ -85,8 +95,15 @@ private:
     // Variance-reduction baseline: running EMA of EV at each info-set
     float*             d_ev_baseline  = nullptr;  // [TABLE_SIZE]
 
+    // Device-side scalars for CUDA Graph replay.
+    // kernel_simulate_batch reads these via pointer so the graph captures
+    // fixed pointer arguments; only the pointed-to values change per replay.
+    long long* d_iter_counter   = nullptr;  // current training iteration
+    int*       d_player_counter = nullptr;  // current update player index
+
     curandStatePhilox4_32_10_t* d_rng_states = nullptr;
-    int rng_count_ = 0;
+    int rng_count_  = 0;
+    int batch_size_ = 0;   // stored at alloc time; used for graph recapture check
 
     int32_t* d_hr_table = nullptr;
 
@@ -104,6 +121,9 @@ private:
     void free_device_buffers();
     void init_rng(int batch_size, unsigned long long seed = 42);
     void run_regret_matching();
+    // Launches only the simulate kernel (no counter update); safe to capture in graph.
+    void launch_sim_kernel(int batch_size);
+    // Updates d_iter_counter / d_player_counter via async memcpy, then calls launch_sim_kernel.
     void run_simulation_batch(int batch_size, int update_player, long long iteration);
     void run_cfr_plus_clamp();
     void allreduce_tables();   // NCCL multi-GPU sync (no-op if !USE_NCCL)
@@ -125,14 +145,14 @@ __global__ void kernel_simulate_batch(
     curandStatePhilox4_32_10_t* __restrict__ rng_states,
     float*                                   regrets,
     float*                                   strategy_sum,
-    const __nv_bfloat16* __restrict__        strategy,    // BF16 input
+    const __nv_bfloat16* __restrict__        strategy,        // BF16 input
     float*                                   ev_baseline,
     int num_games,
-    int update_player,
+    const int*       __restrict__ update_player_ptr,  // device scalar (graph-safe)
     int num_players,
     int starting_stack,
     int sb, int bb,
-    long long iteration,
+    const long long* __restrict__ iteration_ptr,      // device scalar (graph-safe)
     int table_size);
 
 __global__ void kernel_clamp_regrets(float* regrets, int n);

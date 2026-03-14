@@ -1,10 +1,8 @@
 #include "abstraction.h"
 #include "hand_eval.h"
-#include <cmath>
 #include <algorithm>
 #include <vector>
 #include <random>
-#include <array>
 
 // ---------------------------------------------------------------------------
 // Chen formula
@@ -67,12 +65,11 @@ int fast_postflop_bucket(Card h0, Card h1,
                           const Card* community, int n_comm) {
     if (n_comm == 0) return 0;
     uint16_t rank = evaluate_best(h0, h1, community, n_comm);
-    // Map rank [1, 7462] to bucket [0, POSTFLOP_BUCKETS-1]
-    // Bias toward higher values (stronger hands are rarer)
-    int high_val = card_rank(h0) + card_rank(h1);
-    int score = (rank / 7462.0f) * (POSTFLOP_BUCKETS - 1) * 2
-                + (high_val >= 20 ? 1 : 0);
-    return std::min(score, POSTFLOP_BUCKETS - 1);
+    // Map rank [1, 7462] uniformly to bucket [0, POSTFLOP_BUCKETS-1].
+    // Formula matches board_bucket_gpu() in cfr_gpu.cu exactly so that
+    // CPU and GPU bucket assignments are consistent.
+    return std::min((int)((uint32_t)(rank - 1) * POSTFLOP_BUCKETS / 7462u),
+                    POSTFLOP_BUCKETS - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +110,7 @@ int postflop_bucket(Card h0, Card h1,
             Card oh0 = remaining[ri++], oh1 = remaining[ri++];
             uint16_t opp_rank = evaluate_7cards(oh0, oh1,
                 full_comm[0], full_comm[1], full_comm[2], full_comm[3], full_comm[4]);
-            if (opp_rank >= my_rank) { win = false; break; }
+            if (opp_rank > my_rank) { win = false; break; }
         }
         wins += win ? 1 : 0;
         total++;
@@ -127,16 +124,17 @@ void precompute_buckets(const Card* hole_cards,
                         int num_players,
                         int* hole_buckets,
                         int* board_buckets) {
-    for (int p = 0; p < num_players; p++)
+    static const int n_comm_per_street[4] = {0, 3, 4, 5};
+    for (int p = 0; p < num_players; p++) {
         hole_buckets[p] = preflop_bucket(hole_cards[p*2], hole_cards[p*2+1]);
-
-    board_buckets[0] = 0;  // preflop
-    int n_comm_per_street[3] = {3, 4, 5};
-    for (int s = 0; s < 3; s++) {
-        // Use player 0's hole cards as reference for board bucket
-        board_buckets[s + 1] = fast_postflop_bucket(
-            hole_cards[0], hole_cards[1],
-            community, n_comm_per_street[s]);
+        // Each player gets their own board bucket since equity depends on hole cards.
+        // Matches the per-player board_bucket_gpu() computation in cfr_gpu.cu.
+        board_buckets[p * 4 + 0] = 0;  // preflop: no community cards yet
+        for (int s = 1; s < 4; s++) {
+            board_buckets[p * 4 + s] = fast_postflop_bucket(
+                hole_cards[p*2], hole_cards[p*2+1],
+                community, n_comm_per_street[s]);
+        }
     }
 }
 

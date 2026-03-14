@@ -36,6 +36,8 @@ add_executable(poker_cuda
     src/hand_eval.cpp
     src/abstraction.cpp
     src/strategy.cpp
+    src/eval.cpp
+    src/bot.cpp
     src/cfr_gpu.cu
 )
 

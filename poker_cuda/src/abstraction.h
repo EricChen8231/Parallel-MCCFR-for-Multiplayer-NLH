@@ -25,9 +25,11 @@ int postflop_bucket(Card h0, Card h1,
 int fast_postflop_bucket(Card h0, Card h1,
                           const Card* community, int n_comm);
 
-// Precompute per-player hole buckets and board buckets for one iteration
-// hole_buckets[p] = preflop_bucket(hole_cards[p*2], hole_cards[p*2+1])
-// board_buckets[s] = fast_postflop_bucket for street s (0=preflop→0, 1-3=flop/turn/river)
+// Precompute per-player hole buckets and per-player board buckets for one iteration.
+// hole_buckets[p]        = preflop_bucket for player p
+// board_buckets[p*4 + s] = fast_postflop_bucket for player p at street s
+//                          (s=0: preflop→0, s=1-3: flop/turn/river)
+// board_buckets must point to an array of at least num_players * 4 ints.
 void precompute_buckets(const Card* hole_cards,
                         const Card* community,
                         int num_players,
