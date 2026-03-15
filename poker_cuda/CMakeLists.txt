@@ -15,7 +15,7 @@ set(CMAKE_CUDA_ARCHITECTURES "70;80;86" CACHE STRING "CUDA compute capabilities"
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS_RELEASE  "-O3 -march=native -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE  "-O3 -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math -DNDEBUG")
 set(CMAKE_CUDA_FLAGS         "${CMAKE_CUDA_FLAGS} -lineinfo")   # for Nsight
 

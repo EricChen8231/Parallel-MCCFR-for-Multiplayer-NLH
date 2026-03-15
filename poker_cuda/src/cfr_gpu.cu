@@ -304,7 +304,7 @@ deal_cards(ThreadGame& g, int n_deal, curandStatePhilox4_32_10_t* rng)
 static __device__ __forceinline__ uint8_t
 board_bucket_gpu(uint8_t h0, uint8_t h1, const uint8_t* comm, int street)
 {
-    if (street == 0) return 0;
+    if (street == 0 || g_hr == nullptr) return 0;
     uint16_t rank;
     if (street == 3)
         rank = eval7_gpu(h0, h1, comm[0], comm[1], comm[2], comm[3], comm[4]);
@@ -482,9 +482,15 @@ traverse_gpu(ThreadGame& g,
         uint16_t ranks[6] = {};
         for (int p = 0; p < g.N; p++) {
             if (g.folded & (1u << p)) continue;
-            ranks[p] = eval7_gpu(g.hole[p*2], g.hole[p*2+1],
-                                 g.community[0], g.community[1], g.community[2],
-                                 g.community[3], g.community[4]);
+            if (g_hr != nullptr) {
+                ranks[p] = eval7_gpu(g.hole[p*2], g.hole[p*2+1],
+                                     g.community[0], g.community[1], g.community[2],
+                                     g.community[3], g.community[4]);
+            } else {
+                // Fallback when handranks.dat not loaded: use hole card rank sum
+                // as a rough strength proxy (0..24 range). Approximate only.
+                ranks[p] = (uint16_t)((g.hole[p*2] % 13) + (g.hole[p*2+1] % 13) + 1);
+            }
         }
         uint16_t best = 0;
         for (int p = 0; p < g.N; p++)
