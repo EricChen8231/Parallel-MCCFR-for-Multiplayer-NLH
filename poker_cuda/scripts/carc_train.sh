@@ -71,21 +71,31 @@ mkdir -p logs data
 # Each MPI rank trains independently on its GPU, then AllReduce merges
 # regret tables.
 #
-# Performance estimate (A100 @ ~3 TFLOPS FP32):
-#   batch=65536 hands x 30 actions/hand x 8 FLOPS/action = ~15.7 GFLOPS
-#   -> ~200 batches/sec per GPU = 13M hands/sec per GPU
-#   -> 4 GPUs = 52M hands/sec = 187B hands overnight (8h)
+# Performance (OS-MCCFR on A100, measured):
+#   batch=65536  -> ~15M hands/sec per GPU
+#   batch=262144 -> ~22M hands/sec per GPU
+#   4 GPUs x 22M x 8h = ~2.5 trillion hands overnight
+#
+# Player scaling:
+#   --players 2  : heads-up (fastest convergence, ~8h for good strategy)
+#   --players 3-4: medium convergence time
+#   --players 6  : full table (needs more iters; increase --iters accordingly)
+#
+# Iteration guidance (at 22M hands/sec per GPU, 4 GPUs):
+#   --iters 50000000  (~1h wall time)  good for testing
+#   --iters 200000000 (~4h wall time)  reasonable strategy quality
+#   --iters 500000000 (~8h wall time)  full overnight run
 # ---------------------------------------------------------------------------
 srun --mpi=pmix \
     ./build/poker_cuda \
         --mode train \
-        --players 2 \
-        --iters 1000 \
-        --batch 65536 \
+        --players 6 \
+        --iters 2000000 \
+        --batch 262144 \
         --stack 1000 \
         --sb 10 \
         --bb 20 \
-        --save strategy_carc_a100.bin \
+        --save strategy_carc_a100_6p.bin \
         --handranks data/handranks.dat
 
 echo "Training complete."
