@@ -90,7 +90,7 @@ srun --mpi=pmix \
     ./build/poker_cuda \
         --mode train \
         --players 6 \
-        --iters 2000000 \
+        --iters 200000 \
         --batch 262144 \
         --stack 1000 \
         --sb 10 \
@@ -99,5 +99,5 @@ srun --mpi=pmix \
         --handranks data/handranks.dat
 
 echo "Training complete."
-echo "Strategy saved to strategy_carc_a100.bin"
-ls -lh strategy_carc_a100.bin
+echo "Strategy saved to strategy_carc_a100_6p.bin"
+ls -lh strategy_carc_a100_6p.bin

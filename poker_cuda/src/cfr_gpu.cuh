@@ -58,8 +58,10 @@ public:
     bool load_hand_table(const char* path = "data/handranks.dat");
 
     void train(long long total_iterations,
-               int  batch_size = 65536,
-               bool verbose    = true);
+               int  batch_size      = 65536,
+               bool verbose         = true,
+               const std::string& ckpt_path     = "",
+               long long ckpt_interval = 10000);
 
     HostStrategyTable get_strategy() const;
     bool save_checkpoint(const std::string& path) const;

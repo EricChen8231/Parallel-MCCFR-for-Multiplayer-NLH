@@ -270,7 +270,8 @@ int main(int argc, char* argv[])
             printf("\nTraining: players=%d  iters=%lld  batch=%d  ranks=%d\n",
                    n_players, iters, batch_size, mpi_size);
 
-        trainer.train(iters, batch_size, mpi_rank == 0);
+        std::string ckpt_path = (mpi_rank == 0 && !save_path.empty()) ? save_path + ".ckpt" : "";
+        trainer.train(iters, batch_size, mpi_rank == 0, ckpt_path, 10000);
 
         // -----------------------------------------------------------------------
         // MPI AllReduce: merge regret tables from all ranks into a single global

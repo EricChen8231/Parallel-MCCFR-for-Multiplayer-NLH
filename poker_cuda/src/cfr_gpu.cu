@@ -1047,7 +1047,8 @@ void GPUCFRTrainer::allreduce_tables()
 // =============================================================================
 // Main training loop
 // =============================================================================
-void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbose)
+void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbose,
+                          const std::string& ckpt_path, long long ckpt_interval)
 {
     // Only allocate + zero-init if not already done (e.g. by load_checkpoint).
     // Skipping alloc here preserves checkpoint data already in device memory.
@@ -1136,6 +1137,12 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
                    iter, total_iterations,
                    hands_done / 1e6,
                    hands_done / sec / 1e6);
+        }
+
+        if (!ckpt_path.empty() && ckpt_interval > 0 && iter % ckpt_interval == 0 && iter > 0) {
+            CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+            if (save_checkpoint(ckpt_path))
+                printf("  [checkpoint saved at iter %lld -> %s]\n", iter, ckpt_path.c_str());
         }
     }
 
