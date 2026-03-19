@@ -86,6 +86,15 @@ mkdir -p logs data
 #   --iters 200000000 (~4h wall time)  reasonable strategy quality
 #   --iters 500000000 (~8h wall time)  full overnight run
 # ---------------------------------------------------------------------------
+# Resume from checkpoint if one exists from a previous session
+LOAD_FLAG=""
+if [ -f strategy_carc_a100_6p.bin.ckpt ]; then
+    echo "Checkpoint found — resuming from strategy_carc_a100_6p.bin.ckpt"
+    LOAD_FLAG="--load strategy_carc_a100_6p.bin.ckpt"
+else
+    echo "No checkpoint found — starting fresh"
+fi
+
 srun --mpi=pmix \
     ./build/poker_cuda \
         --mode train \
@@ -96,7 +105,8 @@ srun --mpi=pmix \
         --sb 10 \
         --bb 20 \
         --save strategy_carc_a100_6p.bin \
-        --handranks data/handranks.dat
+        --handranks data/handranks.dat \
+        $LOAD_FLAG
 
 echo "Training complete."
 echo "Strategy saved to strategy_carc_a100_6p.bin"

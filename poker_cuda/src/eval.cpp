@@ -296,6 +296,243 @@ static int play_hand(Game2P& g, Deck& deck, std::mt19937& rng,
 }
 
 // ---------------------------------------------------------------------------
+// N-player game state
+// ---------------------------------------------------------------------------
+struct GameNP {
+    int  n;
+    Card hole[MAX_EVAL_PLAYERS][2];
+    Card community[5];
+    int  stacks[MAX_EVAL_PLAYERS];
+    int  bets[MAX_EVAL_PLAYERS];
+    int  invested[MAX_EVAL_PLAYERS];
+    bool folded[MAX_EVAL_PLAYERS];
+    bool all_in[MAX_EVAL_PLAYERS];
+    int  pot, current_bet;
+    uint32_t action_bits;
+    int  street;
+    int  hole_buckets[MAX_EVAL_PLAYERS];
+    int  board_buckets[MAX_EVAL_PLAYERS][4];
+};
+
+// ---------------------------------------------------------------------------
+// N-player betting round.
+// Returns false if only one player remains (everyone else folded).
+// ---------------------------------------------------------------------------
+static bool play_betting_round_np(GameNP& g, int first_to_act, int bot_player,
+                                   const HostStrategyTable& strat, OpponentType opp,
+                                   std::mt19937& rng)
+{
+    int n = g.n;
+    bool needs_to_act[MAX_EVAL_PLAYERS] = {};
+    for (int p = 0; p < n; p++)
+        needs_to_act[p] = !g.folded[p] && !g.all_in[p];
+
+    int p = first_to_act;
+    int safety = n * n * 4;
+    for (int guard = 0; guard < safety; guard++) {
+        bool anyone = false;
+        for (int i = 0; i < n; i++) if (needs_to_act[i]) { anyone = true; break; }
+        if (!anyone) break;
+
+        if (!needs_to_act[p]) { p = (p + 1) % n; continue; }
+
+        int     to_call = g.current_bet - g.bets[p];
+        uint8_t vm      = valid_actions_mask(g.pot, g.stacks[p], to_call);
+
+        int chosen;
+        if (p == bot_player)
+            chosen = trained_action(strat, (uint8_t)p,
+                (uint8_t)g.hole_buckets[p],
+                (uint8_t)g.board_buckets[p][g.street],
+                (uint8_t)g.street, g.action_bits, vm, rng);
+        else
+            chosen = scripted_action(opp, vm, rng);
+
+        g.action_bits = ((g.action_bits << 3) | (uint32_t)chosen) & 0x3FFFFFFFu;
+        needs_to_act[p] = false;
+
+        if (chosen == 0) {  // FOLD
+            g.folded[p] = true;
+            int active = 0;
+            for (int i = 0; i < n; i++) if (!g.folded[i]) active++;
+            if (active <= 1) return false;
+        } else if (chosen != 1) {  // not CHECK
+            int chips = action_to_chips((Action)chosen, g.pot, g.stacks[p], to_call);
+            g.stacks[p]   -= chips;
+            g.bets[p]     += chips;
+            g.invested[p] += chips;
+            g.pot         += chips;
+            if (g.stacks[p] == 0) g.all_in[p] = true;
+
+            if (g.bets[p] > g.current_bet) {  // raise: reopen action
+                g.current_bet = g.bets[p];
+                for (int i = 0; i < n; i++)
+                    if (i != p && !g.folded[i] && !g.all_in[i])
+                        needs_to_act[i] = true;
+            }
+        }
+        p = (p + 1) % n;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Side-pot showdown. Returns net chips won by bot_player.
+// ---------------------------------------------------------------------------
+static int resolve_showdown_np(GameNP& g, int bot_player)
+{
+    int n = g.n;
+
+    // Evaluate hands for all non-folded players
+    uint16_t ranks[MAX_EVAL_PLAYERS] = {};
+    for (int p = 0; p < n; p++) {
+        if (!g.folded[p])
+            ranks[p] = evaluate_7cards(
+                g.hole[p][0], g.hole[p][1],
+                g.community[0], g.community[1], g.community[2],
+                g.community[3], g.community[4]);
+    }
+
+    // Side-pot algorithm: peel off one level of investment at a time.
+    int winnings[MAX_EVAL_PLAYERS] = {};
+    int remaining[MAX_EVAL_PLAYERS];
+    for (int p = 0; p < n; p++) remaining[p] = g.invested[p];
+
+    while (true) {
+        // Find the smallest non-zero contribution remaining
+        int min_inv = INT_MAX;
+        for (int p = 0; p < n; p++)
+            if (remaining[p] > 0 && remaining[p] < min_inv) min_inv = remaining[p];
+        if (min_inv == INT_MAX) break;
+
+        // Build this side pot and mark eligible players
+        int  side_pot = 0;
+        bool eligible[MAX_EVAL_PLAYERS] = {};
+        for (int p = 0; p < n; p++) {
+            if (remaining[p] <= 0) continue;
+            int contrib = std::min(remaining[p], min_inv);
+            side_pot      += contrib;
+            remaining[p]  -= contrib;
+            if (!g.folded[p]) eligible[p] = true;
+        }
+
+        // Find best hand among eligible players
+        uint16_t best = 0;
+        for (int p = 0; p < n; p++)
+            if (eligible[p] && ranks[p] > best) best = ranks[p];
+
+        int n_winners = 0;
+        for (int p = 0; p < n; p++)
+            if (eligible[p] && ranks[p] == best) n_winners++;
+
+        int share = side_pot / n_winners;
+        for (int p = 0; p < n; p++)
+            if (eligible[p] && ranks[p] == best) winnings[p] += share;
+    }
+
+    return winnings[bot_player] - g.invested[bot_player];
+}
+
+// ---------------------------------------------------------------------------
+// Play one N-player hand. Returns net chips for bot_player (seat 0).
+// dealer: position of the dealer button (0..n-1); rotates each hand.
+// ---------------------------------------------------------------------------
+static int play_hand_np(GameNP& g, Deck& deck, std::mt19937& rng,
+                         int bot_player, const HostStrategyTable& strat,
+                         OpponentType opp, int starting_stack,
+                         int sb_amt, int bb_amt, int dealer)
+{
+    int n = g.n;
+
+    deck.shuffle(rng);
+    for (int p = 0; p < n; p++) {
+        g.hole[p][0] = deck.deal();
+        g.hole[p][1] = deck.deal();
+    }
+    for (int i = 0; i < 5; i++) g.community[i] = deck.deal();
+
+    for (int p = 0; p < n; p++) {
+        g.stacks[p]  = starting_stack;
+        g.bets[p]    = g.invested[p] = 0;
+        g.folded[p]  = g.all_in[p]   = false;
+    }
+    g.pot = g.current_bet = 0;
+    g.action_bits = 0;
+    g.street = 0;
+
+    int sb_pos = (dealer + 1) % n;
+    int bb_pos = (dealer + 2) % n;
+
+    // Post blinds
+    auto post = [&](int p, int amt) {
+        int chips = std::min(amt, g.stacks[p]);
+        g.stacks[p] -= chips;
+        g.bets[p]    = chips;
+        g.invested[p]= chips;
+        g.pot       += chips;
+        if (!g.stacks[p]) g.all_in[p] = true;
+    };
+    post(sb_pos, sb_amt);
+    post(bb_pos, bb_amt);
+    g.current_bet = g.bets[bb_pos];
+
+    // Precompute abstraction buckets
+    Card hole_flat[MAX_EVAL_PLAYERS * 2];
+    for (int p = 0; p < n; p++) {
+        hole_flat[p*2]   = g.hole[p][0];
+        hole_flat[p*2+1] = g.hole[p][1];
+    }
+    int hb[MAX_EVAL_PLAYERS], bb_flat[MAX_EVAL_PLAYERS * 4];
+    precompute_buckets(hole_flat, g.community, n, hb, bb_flat);
+    for (int p = 0; p < n; p++) {
+        g.hole_buckets[p] = hb[p];
+        for (int s = 0; s < 4; s++)
+            g.board_buckets[p][s] = bb_flat[p * 4 + s];
+    }
+
+    for (int st = 0; st < 4; st++) {
+        g.street = st;
+        if (st > 0) {
+            for (int p = 0; p < n; p++) g.bets[p] = 0;
+            g.current_bet = 0;
+        }
+
+        int active = 0;
+        for (int p = 0; p < n; p++) if (!g.folded[p]) active++;
+        if (active <= 1) break;
+
+        // Check if all remaining players are all-in (run out the board)
+        int can_act = 0;
+        for (int p = 0; p < n; p++) if (!g.folded[p] && !g.all_in[p]) can_act++;
+        if (can_act <= 1) { if (st == 3) break; continue; }
+
+        // First to act: preflop = UTG (bb+1), postflop = first active left of dealer
+        int first = (st == 0) ? (bb_pos + 1) % n : (dealer + 1) % n;
+        if (st > 0) {
+            for (int i = 0; i < n; i++) {
+                int pp = (dealer + 1 + i) % n;
+                if (!g.folded[pp] && !g.all_in[pp]) { first = pp; break; }
+            }
+        }
+
+        if (!play_betting_round_np(g, first, bot_player, strat, opp, rng)) break;
+
+        active = 0;
+        for (int p = 0; p < n; p++) if (!g.folded[p]) active++;
+        if (active <= 1 || st == 3) break;
+    }
+
+    // If only one player remains, they win the pot uncontested
+    int last = -1, active = 0;
+    for (int p = 0; p < n; p++) if (!g.folded[p]) { last = p; active++; }
+
+    if (active == 1)
+        return (last == bot_player ? g.pot : 0) - g.invested[bot_player];
+
+    return resolve_showdown_np(g, bot_player);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 EvalResult evaluate_strategy(const HostStrategyTable& strat, OpponentType opp,
@@ -312,6 +549,31 @@ EvalResult evaluate_strategy(const HostStrategyTable& strat, OpponentType opp,
         // h even → bot is SB (player 0), h odd → bot is BB (player 1).
         int bot_player = (int)(h & 1);
         net_chips += play_hand(g, deck, rng, bot_player, strat, opp, stack, sb, bb);
+    }
+
+    EvalResult res;
+    res.hands_played = n_hands;
+    res.net_bb       = (double)net_chips / (double)bb;
+    res.bb_per_100   = res.net_bb / (double)n_hands * 100.0;
+    return res;
+}
+
+EvalResult evaluate_strategy_np(const HostStrategyTable& strat, int n_players,
+                                  OpponentType opp, long long n_hands,
+                                  int stack, int sb, int bb, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    Deck deck;
+    GameNP g;
+    g.n = n_players;
+
+    long long net_chips = 0;
+    for (long long h = 0; h < n_hands; h++) {
+        // Rotate dealer button each hand for position fairness.
+        // Bot is always seat 0; it cycles through all positions over n_players hands.
+        int dealer = (int)(h % n_players);
+        net_chips += play_hand_np(g, deck, rng, /*bot_player=*/0,
+                                   strat, opp, stack, sb, bb, dealer);
     }
 
     EvalResult res;

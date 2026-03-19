@@ -36,8 +36,32 @@ struct EvalResult {
 // stack / sb / bb must match the parameters used during training.
 // seed controls the deck RNG for reproducibility.
 // ---------------------------------------------------------------------------
+// 2-player version (legacy)
 EvalResult evaluate_strategy(
     const HostStrategyTable& strat,
+    OpponentType             opp,
+    long long                n_hands,
+    int                      stack = 1000,
+    int                      sb    = 10,
+    int                      bb    = 20,
+    unsigned                 seed  = 42);
+
+// ---------------------------------------------------------------------------
+// evaluate_strategy_np
+//
+// N-player version (2-9 players). Bot occupies seat 0; all other seats are
+// scripted opponents of the given type. Dealer button rotates each hand for
+// position fairness. Supports side pots and multi-way showdowns.
+//
+// n_players must be in [2, 9]. Training was done for up to 6 players;
+// strategy lookups for positions beyond the training player count fall back
+// to uniform-random action.
+// ---------------------------------------------------------------------------
+constexpr int MAX_EVAL_PLAYERS = 9;
+
+EvalResult evaluate_strategy_np(
+    const HostStrategyTable& strat,
+    int                      n_players,
     OpponentType             opp,
     long long                n_hands,
     int                      stack = 1000,

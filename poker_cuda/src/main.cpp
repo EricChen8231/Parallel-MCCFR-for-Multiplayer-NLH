@@ -160,11 +160,18 @@ int main(int argc, char* argv[])
         else if (opponent_str == "balanced")        opp = OpponentType::BALANCED;
         else if (opponent_str == "random")          opp = OpponentType::RANDOM;
 
-        printf("Opponent: %s  |  Hands: %lld\n\n", opponent_str.c_str(), eval_hands);
-        EvalResult res = evaluate_strategy(strat, opp, eval_hands,
-                                           stack_size, sb, bb, /*seed=*/42);
+        if (n_players < 2 || n_players > MAX_EVAL_PLAYERS) {
+            fprintf(stderr, "ERROR: --players must be between 2 and %d for eval mode\n",
+                    MAX_EVAL_PLAYERS);
+            return 1;
+        }
 
-        printf("=== Eval Results ===\n");
+        printf("Opponent: %s  |  Players: %d  |  Hands: %lld\n\n",
+               opponent_str.c_str(), n_players, eval_hands);
+        EvalResult res = evaluate_strategy_np(strat, n_players, opp, eval_hands,
+                                              stack_size, sb, bb, /*seed=*/42);
+
+        printf("=== Eval Results (%d-player) ===\n", n_players);
         printf("  Hands played : %lld\n", res.hands_played);
         printf("  Net BB       : %.1f\n", res.net_bb);
         printf("  BB/100       : %+.2f\n", res.bb_per_100);
