@@ -53,6 +53,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <chrono>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // CUDA error check helper
@@ -77,13 +78,33 @@
 __device__ static int32_t* g_hr = nullptr;  // set from host via cudaMemcpyToSymbol
 
 static __device__ __forceinline__ uint16_t
+decode_packed_rank_gpu(uint16_t packed)
+{
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (ordinal == 0) return 0;
+    switch (cat) {
+        case 1: return ordinal;
+        case 2: return (uint16_t)(1277 + ordinal);
+        case 3: return (uint16_t)(4137 + ordinal);
+        case 4: return (uint16_t)(4995 + ordinal);
+        case 5: return (uint16_t)(5853 + ordinal);
+        case 6: return (uint16_t)(5863 + ordinal);
+        case 7: return (uint16_t)(7140 + ordinal);
+        case 8: return (uint16_t)(7296 + ordinal);
+        case 9: return (uint16_t)(7452 + ordinal);
+        default: return 0;
+    }
+}
+
+static __device__ __forceinline__ uint16_t
 eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
 {
     int p = __ldg(&g_hr[53 + c0 + 1]);
     p     = __ldg(&g_hr[p  + c1 + 1]);
     p     = __ldg(&g_hr[p  + c2 + 1]);
     p     = __ldg(&g_hr[p  + c3 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c4 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c4 + 1]));
 }
 
 // Two Plus Two supports sequential 7-card lookup in exactly 7 steps — no
@@ -98,7 +119,7 @@ eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + c3 + 1]);
     p     = __ldg(&g_hr[p  + c4 + 1]);
     p     = __ldg(&g_hr[p  + c5 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c6 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c6 + 1]));
 }
 
 // 6-card sequential lookup for turn evaluation (2 hole + 4 community).
@@ -111,7 +132,7 @@ eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + c2 + 1]);
     p     = __ldg(&g_hr[p  + c3 + 1]);
     p     = __ldg(&g_hr[p  + c4 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c5 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c5 + 1]));
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +207,61 @@ chips_for_action_gpu(int a, int pot, int stack, int to_call)
         case 7: return stack;
         default: return 0;
     }
+}
+
+static inline int to_rm_host(Card c)
+{
+    return (c % 13) * 4 + (c / 13) + 1;
+}
+
+static inline uint16_t decode_packed_rank_host(uint16_t packed)
+{
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (ordinal == 0) return 0;
+    switch (cat) {
+        case 1: return ordinal;
+        case 2: return (uint16_t)(1277 + ordinal);
+        case 3: return (uint16_t)(4137 + ordinal);
+        case 4: return (uint16_t)(4995 + ordinal);
+        case 5: return (uint16_t)(5853 + ordinal);
+        case 6: return (uint16_t)(5863 + ordinal);
+        case 7: return (uint16_t)(7140 + ordinal);
+        case 8: return (uint16_t)(7296 + ordinal);
+        case 9: return (uint16_t)(7452 + ordinal);
+        default: return 0;
+    }
+}
+
+static bool validate_hand_table_host(const std::vector<int32_t>& hr, const char* path)
+{
+    if (hr.size() != 32487834u) {
+        fprintf(stderr,
+                "[train] incompatible handranks table at %s: expected 32487834 int32 entries, found %zu.\n",
+                path, hr.size());
+        return false;
+    }
+
+    int p = hr[53 + to_rm_host(/*As*/ 51)];
+    p = hr[p + to_rm_host(/*Ks*/ 50)];
+    p = hr[p + to_rm_host(/*Qs*/ 49)];
+    p = hr[p + to_rm_host(/*Js*/ 48)];
+    p = hr[p + to_rm_host(/*Ts*/ 47)];
+    p = hr[p + to_rm_host(/*2c*/ 0)];
+    const uint16_t royal = decode_packed_rank_host(
+        (uint16_t)hr[p + to_rm_host(/*3d*/ 14)]);
+
+    if (royal != 7462) {
+        fprintf(stderr,
+                "[train] incompatible handranks table at %s:\n"
+                "        As Ks Qs Js Ts 2c 3d decoded to %u, expected 7462.\n"
+                "        This trainer assumes the classic tangentforks/TwoPlusTwo\n"
+                "        packed HandRanks.dat format decodable to [1..7462].\n",
+                path, (unsigned)royal);
+        return false;
+    }
+
+    return true;
 }
 
 // =============================================================================
@@ -899,6 +975,7 @@ bool GPUCFRTrainer::load_hand_table(const char* path)
     std::vector<int32_t> host_hr(sz / sizeof(int32_t));
     f.read(reinterpret_cast<char*>(host_hr.data()), sz);
     if (!f) return false;
+    if (!validate_hand_table_host(host_hr, path)) return false;
 
     CUDA_CHECK(cudaMalloc(&d_hr_table, sz));
     CUDA_CHECK(cudaMemcpy(d_hr_table, host_hr.data(), sz, cudaMemcpyHostToDevice));

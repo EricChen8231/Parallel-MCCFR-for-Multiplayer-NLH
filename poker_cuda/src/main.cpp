@@ -32,7 +32,7 @@ static void print_usage(const char* prog)
         "Usage: %s [options]\n"
         "\n"
         "Training / benchmark flags:\n"
-        "  --mode <train|benchmark|eval|info>  (default: train)\n"
+        "  --mode <train|benchmark|eval|info|human>  (default: train)\n"
         "  --players  <N>                      (default: 2)\n"
         "  --iters    <N>                      (default: 1000)\n"
         "  --batch    <N>                      (default: 65536)\n"
@@ -138,8 +138,9 @@ int main(int argc, char* argv[])
         // Load hand evaluator (needed for showdown evaluation)
         abstraction_init();
         if (!hand_eval_init(hr_path.c_str())) {
-            fprintf(stderr, "ERROR: Could not load handranks.dat from %s\n"
-                    "  Download: https://github.com/tangentforks/TwoPlusTwoHandEvaluator\n",
+            fprintf(stderr, "ERROR: Could not load a compatible handranks.dat from %s\n"
+                    "  Expected: tangentforks/TwoPlusTwo packed HandRanks.dat\n"
+                    "  decodable to the standard [1..7462] rank scale.\n",
                     hr_path.c_str());
             return 1;
         }
@@ -192,7 +193,10 @@ int main(int argc, char* argv[])
     if (mode == "play") {
         abstraction_init();
         if (!hand_eval_init(hr_path.c_str())) {
-            fprintf(stderr, "ERROR: Could not load handranks.dat from %s\n", hr_path.c_str());
+            fprintf(stderr,
+                    "ERROR: Could not load a compatible handranks.dat from %s\n"
+                    "  Expected: tangentforks/TwoPlusTwo packed HandRanks.dat\n",
+                    hr_path.c_str());
             return 1;
         }
 
@@ -236,6 +240,36 @@ int main(int argc, char* argv[])
     }
 
     // =========================================================================
+    // HUMAN mode: CPU-only interactive heads-up session
+    // =========================================================================
+    if (mode == "human") {
+        abstraction_init();
+        if (!hand_eval_init(hr_path.c_str())) {
+            fprintf(stderr,
+                    "ERROR: Could not load a compatible handranks.dat from %s\n"
+                    "  Expected: tangentforks/TwoPlusTwo packed HandRanks.dat\n",
+                    hr_path.c_str());
+            return 1;
+        }
+
+        std::string strat_file = strategy_path.empty() ? save_path : strategy_path;
+        printf("Human mode: loading strategy from %s ...\n", strat_file.c_str());
+        HostStrategyTable strat;
+        if (!strategy_load(strat, strat_file)) {
+            fprintf(stderr, "ERROR: Could not load strategy from %s\n", strat_file.c_str());
+            return 1;
+        }
+        printf("  Loaded %zu info sets.\n", strat.size());
+
+        play_vs_human(strat, eval_hands, stack_size, sb, bb, /*seed=*/42);
+
+#ifdef USE_MPI
+        MPI_Finalize();
+#endif
+        return 0;
+    }
+
+    // =========================================================================
     // TRAIN / BENCHMARK modes: GPU required
     // =========================================================================
     if (mpi_rank == 0) {
@@ -256,12 +290,13 @@ int main(int argc, char* argv[])
                           use_cfr_plus, use_linear_cfr);
 
     if (!trainer.load_hand_table(hr_path.c_str())) {
-        if (mpi_rank == 0)
+        if (mpi_rank == 0) {
             fprintf(stderr,
-                "WARNING: Could not load %s\n"
-                "  Download: https://github.com/tangentforks/TwoPlusTwoHandEvaluator\n"
-                "  Continuing without exact hand evaluation (postflop approximate)\n",
-                hr_path.c_str());
+                    "ERROR: Could not load a compatible handranks.dat from %s\n"
+                    "  Training and benchmark modes require the tangentforks/TwoPlusTwo packed table.\n",
+                    hr_path.c_str());
+        }
+        return 1;
     }
 
     if (!load_path.empty()) {
@@ -326,7 +361,11 @@ int main(int argc, char* argv[])
         if (mpi_rank == 0) printf("\nBenchmark: batch sizes vs throughput\n");
         for (int bs : {4096, 16384, 65536, 262144}) {
             GPUCFRTrainer t2(n_players, stack_size, sb, bb, use_cfr_plus, use_linear_cfr);
-            t2.load_hand_table(hr_path.c_str());
+            if (!t2.load_hand_table(hr_path.c_str())) {
+                fprintf(stderr, "ERROR: Could not load a compatible handranks.dat from %s\n",
+                        hr_path.c_str());
+                return 1;
+            }
             auto t0 = std::chrono::high_resolution_clock::now();
             t2.train(10, bs, false);
             auto t1 = std::chrono::high_resolution_clock::now();

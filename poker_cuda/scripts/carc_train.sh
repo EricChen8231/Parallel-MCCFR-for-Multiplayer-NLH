@@ -1,5 +1,7 @@
 #!/bin/bash
 # =============================================================================
+
+set -euo pipefail
 # carc_train.sh -- SLURM job script for CUDA CFR training on USC CARC
 #
 # Usage:
@@ -86,13 +88,22 @@ mkdir -p logs data
 #   --iters 200000000 (~4h wall time)  reasonable strategy quality
 #   --iters 500000000 (~8h wall time)  full overnight run
 # ---------------------------------------------------------------------------
-# Resume from checkpoint if one exists from a previous session
-LOAD_FLAG=""
-if [ -f strategy_carc_a100_6p.bin.ckpt ]; then
-    echo "Checkpoint found — resuming from strategy_carc_a100_6p.bin.ckpt"
-    LOAD_FLAG="--load strategy_carc_a100_6p.bin.ckpt"
+OUT_BASE="${OUT_BASE:-strategy_carc_a100_6p.bin}"
+CKPT_PATH="${OUT_BASE}.ckpt"
+RESUME="${RESUME:-0}"
+
+LOAD_FLAG=()
+if [ "$RESUME" = "1" ]; then
+    if [ -f "$CKPT_PATH" ]; then
+        echo "RESUME=1 and checkpoint found — resuming from $CKPT_PATH"
+        LOAD_FLAG=(--load "$CKPT_PATH")
+    else
+        echo "ERROR: RESUME=1 but checkpoint not found at $CKPT_PATH"
+        exit 1
+    fi
 else
-    echo "No checkpoint found — starting fresh"
+    echo "Starting fresh training run (resume disabled by default)."
+    echo "To resume explicitly, submit with: sbatch --export=ALL,RESUME=1 scripts/carc_train.sh"
 fi
 
 srun --mpi=pmix \
@@ -104,10 +115,10 @@ srun --mpi=pmix \
         --stack 1000 \
         --sb 10 \
         --bb 20 \
-        --save strategy_carc_a100_6p.bin \
+        --save "$OUT_BASE" \
         --handranks data/handranks.dat \
-        $LOAD_FLAG
+        "${LOAD_FLAG[@]}"
 
 echo "Training complete."
-echo "Strategy saved to strategy_carc_a100_6p.bin"
-ls -lh strategy_carc_a100_6p.bin
+echo "Strategy saved to $OUT_BASE"
+ls -lh "$OUT_BASE"

@@ -108,13 +108,14 @@ echo ""
 echo "--- GPU Info ---"
 ./build/poker_cuda --mode info
 echo ""
-echo "--- Benchmark (batch=4096, iters=10, no handranks needed) ---"
+echo "--- Benchmark (batch=4096, iters=10, requires handranks.dat) ---"
 ./build/poker_cuda \
     --mode benchmark \
     --players 2 \
     --iters 10 \
     --batch 4096 \
-    --stack 1000 --sb 10 --bb 20
+    --stack 1000 --sb 10 --bb 20 \
+    --handranks data/handranks.dat
 
 echo ""
 echo "All checks passed. Ready to submit:"

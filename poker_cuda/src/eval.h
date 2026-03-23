@@ -68,3 +68,24 @@ EvalResult evaluate_strategy_np(
     int                      sb    = 10,
     int                      bb    = 20,
     unsigned                 seed  = 42);
+
+// ---------------------------------------------------------------------------
+// play_vs_human
+//
+// Interactive heads-up session: human vs. trained bot.
+// Positions (SB/BB) alternate every hand. Dealer rotates.
+//
+// Cards displayed as: 2-9, T, J, Q, K, A  x  c d h s
+// Actions entered via stdin:
+//   f=fold  k=check  c=call  3/4/6=preset raises  r <total>=raise to total
+//   a=all-in
+//
+// Requires hand_eval_init() and abstraction_init() to have been called.
+// ---------------------------------------------------------------------------
+void play_vs_human(
+    const HostStrategyTable& strat,
+    long long                n_hands = 50,
+    int                      stack   = 1000,
+    int                      sb      = 10,
+    int                      bb      = 20,
+    unsigned                 seed    = 42);
