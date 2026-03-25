@@ -102,7 +102,7 @@ private:
     OpponentObs obs_;
 
     // Look up GTO action probabilities from the trained strategy table.
-    // out must be float[GPU_NUM_ACTIONS].  Uniform fallback if key not found.
+    // out must be float[GPU_NUM_ACTIONS]. Passive fallback if key not found.
     void gto_probs(float* out, uint8_t player, uint8_t hole_b, uint8_t board_b,
                    uint8_t street, uint32_t action_bits, uint8_t valid_mask) const;
 

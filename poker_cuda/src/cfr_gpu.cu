@@ -170,7 +170,8 @@ info_set_hash(uint8_t player, uint8_t hole_bucket, uint8_t board_bucket,
 // in strategy.  This eliminates warp divergence: every thread loops 8 times.
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ uint8_t
-valid_mask_gpu(int pot, int stack, int to_call)
+valid_mask_gpu(int pot, int stack, int to_call,
+               int current_bet, int last_full_raise, int bb_amt)
 {
     if (pot <= 0) pot = 1;
     uint8_t mask = 0;
@@ -184,26 +185,45 @@ valid_mask_gpu(int pot, int stack, int to_call)
     }
     int head = stack - to_call;
     if (head <= 0) return mask;
-    if (head > pot/4 && pot/4 > 0) mask |= (1 << 3);  // RAISE_QUARTER
-    if (head > pot/2 && pot/2 > 0) mask |= (1 << 4);  // RAISE_HALF
-    if (head > pot/3 && pot/3 > 0) mask |= (1 << 5);  // RAISE_THIRD
-    if (head > pot)                 mask |= (1 << 6);  // RAISE_POT
+
+    const int min_raise_to = (current_bet == 0)
+        ? max(1, bb_amt)
+        : current_bet + max(last_full_raise, bb_amt);
+    const int max_raise_to = current_bet + head;
+    if (max_raise_to >= min_raise_to) {
+        if (max(min_raise_to, current_bet + max(1, pot / 4)) <= max_raise_to) mask |= (1 << 3);
+        if (max(min_raise_to, current_bet + max(1, pot / 2)) <= max_raise_to) mask |= (1 << 4);
+        if (max(min_raise_to, current_bet + max(1, pot / 3)) <= max_raise_to) mask |= (1 << 5);
+        if (max(min_raise_to, current_bet + max(1, pot))     <= max_raise_to) mask |= (1 << 6);
+    }
     mask |= (1 << 7);                                  // ALL_IN
     return mask;
 }
 
 static __device__ __forceinline__ int
-chips_for_action_gpu(int a, int pot, int stack, int to_call)
+chips_for_action_gpu(int a, int pot, int stack, int to_call,
+                     int current_bet, int last_full_raise, int bb_amt)
 {
     if (pot <= 0) pot = 1;
+    const int min_raise_to = (current_bet == 0)
+        ? max(1, bb_amt)
+        : current_bet + max(last_full_raise, bb_amt);
+    const int max_raise_to = current_bet + max(0, stack - to_call);
     switch (a) {
         case 0: return 0;
         case 1: return 0;
         case 2: return min(to_call, stack);
-        case 3: return min(to_call + max(1, pot/4), stack);
-        case 4: return min(to_call + max(1, pot/2), stack);
-        case 5: return min(to_call + max(1, pot/3), stack);
-        case 6: return min(to_call + pot,           stack);
+        case 3:
+        case 4:
+        case 5:
+        case 6: {
+            int target_raise_to = min_raise_to;
+            if (a == 4) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 2));
+            if (a == 5) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 3));
+            if (a == 6) target_raise_to = max(min_raise_to, current_bet + max(1, pot));
+            target_raise_to = min(target_raise_to, max_raise_to);
+            return min(to_call + max(0, target_raise_to - current_bet), stack);
+        }
         case 7: return stack;
         default: return 0;
     }
@@ -347,6 +367,8 @@ struct ThreadGame {
     uint8_t all_in;           // bitmask
     int     pot;
     int     current_bet;
+    int     last_full_raise;
+    int     bb_amt;
     uint32_t action_bits;     // compressed action history (3 bits per action)
     int     street;
     int     to_act[6];
@@ -372,6 +394,7 @@ struct ActionState {
     uint8_t  all_in;
     int      pot;
     int      current_bet;
+    int      last_full_raise;
     uint32_t action_bits;
     int      street;
     int      n_to_act;
@@ -389,6 +412,7 @@ static __device__ __forceinline__ ActionState save_action(const ThreadGame& g) {
     s.all_in      = g.all_in;
     s.pot         = g.pot;
     s.current_bet = g.current_bet;
+    s.last_full_raise = g.last_full_raise;
     s.action_bits = g.action_bits;
     s.street      = g.street;
     s.n_to_act    = g.n_to_act;
@@ -406,6 +430,7 @@ static __device__ __forceinline__ void restore_action(ThreadGame& g, const Actio
     g.all_in      = s.all_in;
     g.pot         = s.pot;
     g.current_bet = s.current_bet;
+    g.last_full_raise = s.last_full_raise;
     g.action_bits = s.action_bits;
     g.street      = s.street;
     g.n_to_act    = s.n_to_act;
@@ -454,6 +479,17 @@ board_bucket_gpu(uint8_t h0, uint8_t h1, const uint8_t* comm, int street)
 // selection is a single integer multiply with no conditional branch.
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ int
+fallback_action_passive_gpu(uint8_t valid_mask)
+{
+    if (valid_mask & (1 << 1)) return 1;  // CHECK
+    if (valid_mask & (1 << 2)) return 2;  // CALL
+    if (valid_mask & (1 << 0)) return 0;  // FOLD
+    for (int a = 3; a < GPU_NUM_ACTIONS; a++)
+        if (valid_mask & (1 << a)) return a;
+    return 1;
+}
+
+static __device__ __forceinline__ int
 sample_action(curandStatePhilox4_32_10_t* rng,
               const __nv_bfloat16* __restrict__ strategy,
               uint32_t info_idx, int table_size, uint8_t valid_mask)
@@ -469,8 +505,8 @@ sample_action(curandStatePhilox4_32_10_t* rng,
         int crossed = valid & (result < 0) & (r <= cum);
         result += crossed * (a - result);  // if crossed: result=a; else: unchanged
     }
-    // Fallback: highest valid action (handles zero-probability edge case)
-    if (result < 0) result = 31 - __clz((unsigned)valid_mask);
+    // Fallback: prefer a passive legal action over a random jam.
+    if (result < 0) result = fallback_action_passive_gpu(valid_mask);
     return result;
 }
 
@@ -482,7 +518,9 @@ static __device__ __forceinline__ bool
 apply_action_gpu(ThreadGame& g, int player, int a)
 {
     int to_call = g.current_bet - g.bets[player];
-    int chips   = chips_for_action_gpu(a, g.pot, g.stacks[player], to_call);
+    int chips   = chips_for_action_gpu(
+        a, g.pot, g.stacks[player], to_call,
+        g.current_bet, g.last_full_raise, g.bb_amt);
 
     // Compress action into history (3 bits per action); mask to 30 bits to
     // prevent high-bit overflow corrupting the FNV-1a hash after 10+ actions.
@@ -498,6 +536,10 @@ apply_action_gpu(ThreadGame& g, int player, int a)
     if (g.stacks[player] == 0) g.all_in |= (1u << player);
 
     if (g.bets[player] > g.current_bet) {
+        const int prev_bet = g.current_bet;
+        const int raise_size = g.bets[player] - prev_bet;
+        if (raise_size >= g.last_full_raise || prev_bet == 0)
+            g.last_full_raise = raise_size;
         g.current_bet = g.bets[player];
         return true;  // raise — caller must rebuild action queue
     }
@@ -608,6 +650,7 @@ traverse_gpu(ThreadGame& g,
             g.street++;
             for (int i = 0; i < g.N; i++) g.bets[i] = 0;
             g.current_bet = 0;
+            g.last_full_raise = g.bb_amt;
             g.n_to_act = 0;
             for (int i = 1; i <= g.N; i++) {
                 int p = (g.dealer + i) % g.N;
@@ -649,7 +692,9 @@ traverse_gpu(ThreadGame& g,
     // --- Get current actor ---
     int player  = g.to_act[0];
     int to_call = g.current_bet - g.bets[player];
-    uint8_t vm  = valid_mask_gpu(g.pot, g.stacks[player], to_call);
+    uint8_t vm  = valid_mask_gpu(
+        g.pot, g.stacks[player], to_call,
+        g.current_bet, g.last_full_raise, g.bb_amt);
     uint32_t info_idx = info_set_hash(
         (uint8_t)player,
         g.hole_buckets[player],
@@ -845,12 +890,15 @@ void kernel_simulate_batch(
         g.stacks[i] = starting_stack; g.bets[i] = 0; g.invested[i] = 0;
     }
     g.folded = 0; g.all_in = 0; g.pot = 0; g.current_bet = 0;
+    g.last_full_raise = bb;
+    g.bb_amt = bb;
     g.action_bits = 0; g.street = 0;
 
     g.dealer = (int)(curand(&local_rng) % num_players);
 
-    int sb_pos = (g.dealer + 1) % num_players;
-    int bb_pos = (g.dealer + 2) % num_players;
+    int sb_pos = (num_players == 2) ? g.dealer : (g.dealer + 1) % num_players;
+    int bb_pos = (num_players == 2) ? ((g.dealer + 1) % num_players)
+                                    : (g.dealer + 2) % num_players;
     int sb_amt = min(sb, g.stacks[sb_pos]);
     int bb_amt = min(bb, g.stacks[bb_pos]);
     g.stacks[sb_pos] -= sb_amt; g.bets[sb_pos] = sb_amt; g.invested[sb_pos] = sb_amt;

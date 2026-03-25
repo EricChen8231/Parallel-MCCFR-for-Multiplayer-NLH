@@ -58,10 +58,14 @@ static const char* ACTION_NAME[] = {
 };
 
 // Returns bitmask of valid actions (bit i = Action i is valid)
-uint8_t valid_actions_mask(int pot, int stack, int to_call);
+uint8_t valid_actions_mask(int pot, int stack, int to_call,
+                           int current_bet, int last_full_raise, int bb_amt);
 
 // List valid actions as array, returns count
-int valid_actions_list(int pot, int stack, int to_call, Action* out);
+int valid_actions_list(int pot, int stack, int to_call,
+                       int current_bet, int last_full_raise, int bb_amt,
+                       Action* out);
 
 // Convert action to chips added to pot
-int action_to_chips(Action a, int pot, int stack, int to_call);
+int action_to_chips(Action a, int pot, int stack, int to_call,
+                    int current_bet, int last_full_raise, int bb_amt);

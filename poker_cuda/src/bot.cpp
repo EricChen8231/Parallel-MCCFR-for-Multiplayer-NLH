@@ -74,8 +74,18 @@ LiveBot::LiveBot(const HostStrategyTable& strat, int stack, int sb, int bb)
     : strat_(strat), stack_(stack), sb_(sb), bb_(bb) {}
 
 // ---------------------------------------------------------------------------
-// gto_probs — load normalized strategy from table, uniform fallback
+// gto_probs — load normalized strategy from table, passive fallback
 // ---------------------------------------------------------------------------
+static int fallback_action_passive(uint8_t valid_mask)
+{
+    if (valid_mask & (1 << 1)) return 1;  // CHECK
+    if (valid_mask & (1 << 2)) return 2;  // CALL
+    if (valid_mask & (1 << 0)) return 0;  // FOLD
+    for (int a = 3; a < GPU_NUM_ACTIONS; a++)
+        if (valid_mask & (1 << a)) return a;
+    return 1;
+}
+
 void LiveBot::gto_probs(float* out, uint8_t player, uint8_t hole_b,
                          uint8_t board_b, uint8_t street,
                          uint32_t action_bits, uint8_t valid_mask) const
@@ -86,13 +96,9 @@ void LiveBot::gto_probs(float* out, uint8_t player, uint8_t hole_b,
         memcpy(out, it->second.probs, GPU_NUM_ACTIONS * sizeof(float));
         return;
     }
-    // Info set not seen during training: uniform over valid actions
-    float n_valid = 0.f;
-    for (int a = 0; a < GPU_NUM_ACTIONS; a++)
-        if (valid_mask & (1 << a)) n_valid += 1.f;
-    float p = (n_valid > 0.f) ? 1.f / n_valid : 0.f;
-    for (int a = 0; a < GPU_NUM_ACTIONS; a++)
-        out[a] = (valid_mask & (1 << a)) ? p : 0.f;
+    // Info set not seen during training: prefer a passive legal action.
+    std::fill(out, out + GPU_NUM_ACTIONS, 0.f);
+    out[fallback_action_passive(valid_mask)] = 1.f;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,11 +171,7 @@ int LiveBot::sample_action(const float* probs, uint8_t vmask, std::mt19937& rng)
         if (vmask & (1 << a)) total += probs[a];
 
     if (total < 1e-7f) {
-        // Degenerate: uniform fallback
-        std::vector<int> valid;
-        for (int a = 0; a < GPU_NUM_ACTIONS; a++)
-            if (vmask & (1 << a)) valid.push_back(a);
-        return valid[rng() % valid.size()];
+        return fallback_action_passive(vmask);
     }
 
     float r = std::uniform_real_distribution<float>(0.f, total)(rng);
@@ -269,7 +271,7 @@ struct Hand2P {
     Card community[5];
     int  stacks[2], bets[2], invested[2];
     bool folded[2], all_in_flag[2];
-    int  pot, current_bet;
+    int  pot, current_bet, last_full_raise, bb_amt;
     uint32_t action_bits;
     int  street;
     int  hole_buckets[2];
@@ -294,7 +296,8 @@ static bool play_betting_round_bot(Hand2P& g, int first_to_act, int bot_player,
         if (!needs_to_act[p]) { p = 1 - p; continue; }
 
         int     to_call = g.current_bet - g.bets[p];
-        uint8_t vm      = valid_actions_mask(g.pot, g.stacks[p], to_call);
+        uint8_t vm      = valid_actions_mask(
+            g.pot, g.stacks[p], to_call, g.current_bet, g.last_full_raise, g.bb_amt);
 
         int chosen;
         if (p == bot_player) {
@@ -315,7 +318,10 @@ static bool play_betting_round_bot(Hand2P& g, int first_to_act, int bot_player,
         if (chosen == 0) { g.folded[p] = true; return false; }
 
         if (chosen != 1) {
-            int chips = action_to_chips((Action)chosen, g.pot, g.stacks[p], to_call);
+            int chips = action_to_chips(
+                (Action)chosen, g.pot, g.stacks[p], to_call,
+                g.current_bet, g.last_full_raise, g.bb_amt);
+            const int prev_bet = g.current_bet;
             g.stacks[p]   -= chips;
             g.bets[p]     += chips;
             g.invested[p] += chips;
@@ -323,6 +329,9 @@ static bool play_betting_round_bot(Hand2P& g, int first_to_act, int bot_player,
             if (g.stacks[p] == 0) { g.all_in_flag[p] = true; needs_to_act[p] = false; }
 
             if (g.bets[p] > g.current_bet) {
+                const int raise_size = g.bets[p] - prev_bet;
+                if (raise_size >= g.last_full_raise || prev_bet == 0)
+                    g.last_full_raise = raise_size;
                 g.current_bet     = g.bets[p];
                 needs_to_act[1-p] = !g.folded[1-p] && !g.all_in_flag[1-p];
             }
@@ -351,7 +360,12 @@ static int play_hand_bot(Hand2P& g, Deck& deck, std::mt19937& rng,
         g.bets[p] = g.invested[p] = 0;
         g.folded[p] = g.all_in_flag[p] = false;
     }
-    g.pot = 0; g.current_bet = 0; g.action_bits = 0; g.street = 0;
+    g.pot = 0;
+    g.current_bet = 0;
+    g.last_full_raise = bb_amt;
+    g.bb_amt = bb_amt;
+    g.action_bits = 0;
+    g.street = 0;
 
     // Post blinds: P0 = SB, P1 = BB
     int s0 = std::min(sb_amt, g.stacks[0]);
@@ -373,12 +387,17 @@ static int play_hand_bot(Hand2P& g, Deck& deck, std::mt19937& rng,
 
     for (int st = 0; st < 4; st++) {
         g.street = st;
-        if (st > 0) { g.bets[0] = g.bets[1] = 0; g.current_bet = 0; }
+        if (st > 0) {
+            g.bets[0] = g.bets[1] = 0;
+            g.current_bet = 0;
+            g.last_full_raise = g.bb_amt;
+        }
 
         int active = (!g.folded[0] ? 1 : 0) + (!g.folded[1] ? 1 : 0);
         if (active <= 1) break;
 
-        if (!play_betting_round_bot(g, 0, bot_player, bot, opp, rng)) break;
+        const int first_to_act = (st == 0) ? 0 : 1;
+        if (!play_betting_round_bot(g, first_to_act, bot_player, bot, opp, rng)) break;
 
         active = (!g.folded[0] ? 1 : 0) + (!g.folded[1] ? 1 : 0);
         if (active <= 1 || st == 3) break;

@@ -141,7 +141,31 @@ void precompute_buckets(const Card* hole_cards,
 // ---------------------------------------------------------------------------
 // Action abstraction
 // ---------------------------------------------------------------------------
-uint8_t valid_actions_mask(int pot, int stack, int to_call) {
+static int min_raise_to_total(int current_bet, int last_full_raise, int bb_amt)
+{
+    if (current_bet == 0) return std::max(1, bb_amt);
+    return current_bet + std::max(last_full_raise, bb_amt);
+}
+
+static int chips_from_raise_to(int raise_to, int stack, int to_call, int current_bet)
+{
+    return std::min(to_call + std::max(0, raise_to - current_bet), stack);
+}
+
+static int raise_target_for_action(Action a, int pot, int current_bet,
+                                   int min_raise_to)
+{
+    switch (a) {
+        case Action::RAISE_QUARTER: return std::max(min_raise_to, current_bet + std::max(1, pot / 4));
+        case Action::RAISE_HALF:    return std::max(min_raise_to, current_bet + std::max(1, pot / 2));
+        case Action::RAISE_THIRD:   return std::max(min_raise_to, current_bet + std::max(1, pot / 3));
+        case Action::RAISE_POT:     return std::max(min_raise_to, current_bet + std::max(1, pot));
+        default:                    return min_raise_to;
+    }
+}
+
+uint8_t valid_actions_mask(int pot, int stack, int to_call,
+                           int current_bet, int last_full_raise, int bb_amt) {
     if (pot <= 0) pot = 1;
     uint8_t mask = 0;
 
@@ -159,36 +183,51 @@ uint8_t valid_actions_mask(int pot, int stack, int to_call) {
     int headroom = stack - to_call;
     if (headroom <= 0) return mask;
 
-    if (headroom > pot / 4 && pot / 4 > 0)
-        mask |= (1 << (int)Action::RAISE_QUARTER);
-    if (headroom > pot / 2 && pot / 2 > 0)
-        mask |= (1 << (int)Action::RAISE_HALF);
-    if (headroom > pot / 3 && pot / 3 > 0)
-        mask |= (1 << (int)Action::RAISE_THIRD);
-    if (headroom > pot)
-        mask |= (1 << (int)Action::RAISE_POT);
+    const int max_raise_to = current_bet + headroom;
+    const int min_raise_to = min_raise_to_total(current_bet, last_full_raise, bb_amt);
+    if (max_raise_to >= min_raise_to) {
+        if (raise_target_for_action(Action::RAISE_QUARTER, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_QUARTER);
+        if (raise_target_for_action(Action::RAISE_HALF, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_HALF);
+        if (raise_target_for_action(Action::RAISE_THIRD, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_THIRD);
+        if (raise_target_for_action(Action::RAISE_POT, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_POT);
+    }
     mask |= (1 << (int)Action::ALL_IN);
     return mask;
 }
 
-int valid_actions_list(int pot, int stack, int to_call, Action* out) {
-    uint8_t mask = valid_actions_mask(pot, stack, to_call);
+int valid_actions_list(int pot, int stack, int to_call,
+                       int current_bet, int last_full_raise, int bb_amt,
+                       Action* out) {
+    uint8_t mask = valid_actions_mask(
+        pot, stack, to_call, current_bet, last_full_raise, bb_amt);
     int n = 0;
     for (int a = 0; a < NUM_ACTIONS; a++)
         if (mask & (1 << a)) out[n++] = (Action)a;
     return n;
 }
 
-int action_to_chips(Action a, int pot, int stack, int to_call) {
+int action_to_chips(Action a, int pot, int stack, int to_call,
+                    int current_bet, int last_full_raise, int bb_amt) {
     if (pot <= 0) pot = 1;
+    const int min_raise_to = min_raise_to_total(current_bet, last_full_raise, bb_amt);
+    const int max_raise_to = current_bet + std::max(0, stack - to_call);
     switch (a) {
         case Action::FOLD:          return 0;
         case Action::CHECK:         return 0;
         case Action::CALL:          return std::min(to_call, stack);
-        case Action::RAISE_QUARTER: return std::min(to_call + std::max(1, pot/4), stack);
-        case Action::RAISE_HALF:    return std::min(to_call + std::max(1, pot/2), stack);
-        case Action::RAISE_THIRD:   return std::min(to_call + std::max(1, pot/3), stack);
-        case Action::RAISE_POT:     return std::min(to_call + pot,               stack);
+        case Action::RAISE_QUARTER:
+        case Action::RAISE_HALF:
+        case Action::RAISE_THIRD:
+        case Action::RAISE_POT: {
+            const int raise_to = std::min(
+                raise_target_for_action(a, pot, current_bet, min_raise_to),
+                max_raise_to);
+            return chips_from_raise_to(raise_to, stack, to_call, current_bet);
+        }
         case Action::ALL_IN:        return stack;
         default:                    return 0;
     }

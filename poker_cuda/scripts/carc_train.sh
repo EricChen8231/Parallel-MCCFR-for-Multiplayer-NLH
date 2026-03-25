@@ -6,9 +6,20 @@ set -euo pipefail
 #
 # Usage:
 #   sbatch scripts/carc_train.sh
+#   sbatch --partition=gpu --gres=gpu:a40:1 --nodes=1 --time=04:00:00 scripts/carc_train.sh
+#   sbatch --partition=debug --gres=gpu:a40:1 --nodes=1 --time=01:00:00 scripts/carc_train.sh
 #
-# Targets: A100 (partition=gpu, 80GB VRAM)
-#   - 4 nodes x 1 A100 each = 4 GPUs total (via MPI)
+# Defaults target A100 on the gpu partition.
+# You can override the Slurm resource requests on the sbatch command line.
+# Common Discovery GPU types:
+#   a100 -> sm_80
+#   a40  -> sm_86
+#   l40s -> sm_89
+#   v100 -> sm_70
+#   p100 -> sm_60
+#
+# Example default profile:
+#   - 4 nodes x 1 GPU each = 4 GPUs total (via MPI)
 #   - Each GPU runs 65536 games/batch x 1000 iters = 65.5M games
 #   - Total: 262M games across 4 GPUs with MPI AllReduce
 # =============================================================================
@@ -45,13 +56,37 @@ export CUDAHOSTCXX=$(which g++)
 export LD_LIBRARY_PATH=$(dirname $(which nvcc))/../lib64:$LD_LIBRARY_PATH
 
 # ---------------------------------------------------------------------------
+# Configurable training/build defaults
+# ---------------------------------------------------------------------------
+GPU_TYPE="${GPU_TYPE:-a100}"
+case "$GPU_TYPE" in
+    a100) DEFAULT_CUDA_ARCH=80 ;;
+    a40)  DEFAULT_CUDA_ARCH=86 ;;
+    l40s) DEFAULT_CUDA_ARCH=89 ;;
+    v100) DEFAULT_CUDA_ARCH=70 ;;
+    p100) DEFAULT_CUDA_ARCH=60 ;;
+    *)
+        echo "ERROR: Unsupported GPU_TYPE='$GPU_TYPE'. Use one of: a100 a40 l40s v100 p100"
+        exit 1
+        ;;
+esac
+
+CUDA_ARCH="${CUDA_ARCH:-$DEFAULT_CUDA_ARCH}"
+PLAYERS="${PLAYERS:-6}"
+ITERS="${ITERS:-200000}"
+BATCH="${BATCH:-262144}"
+STACK_SIZE="${STACK_SIZE:-1000}"
+SB_SIZE="${SB_SIZE:-10}"
+BB_SIZE="${BB_SIZE:-20}"
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 cd $SLURM_SUBMIT_DIR
 mkdir -p build && cd build
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES="80" \
+    -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
     -DCMAKE_CUDA_HOST_COMPILER="$(which g++)"
 make -j${SLURM_CPUS_PER_TASK:-8}
 if [ $? -ne 0 ]; then echo "ERROR: Build failed"; exit 1; fi
@@ -88,7 +123,7 @@ mkdir -p logs data
 #   --iters 200000000 (~4h wall time)  reasonable strategy quality
 #   --iters 500000000 (~8h wall time)  full overnight run
 # ---------------------------------------------------------------------------
-OUT_BASE="${OUT_BASE:-strategy_carc_a100_6p.bin}"
+OUT_BASE="${OUT_BASE:-strategy_carc_${GPU_TYPE}_${PLAYERS}p.bin}"
 CKPT_PATH="${OUT_BASE}.ckpt"
 RESUME="${RESUME:-0}"
 
@@ -106,15 +141,21 @@ else
     echo "To resume explicitly, submit with: sbatch --export=ALL,RESUME=1 scripts/carc_train.sh"
 fi
 
+echo "Training config:"
+echo "  GPU_TYPE=$GPU_TYPE  CUDA_ARCH=$CUDA_ARCH"
+echo "  PLAYERS=$PLAYERS  ITERS=$ITERS  BATCH=$BATCH"
+echo "  STACK=$STACK_SIZE  BLINDS=$SB_SIZE/$BB_SIZE"
+echo "  OUT_BASE=$OUT_BASE"
+
 srun --mpi=pmix \
     ./build/poker_cuda \
         --mode train \
-        --players 6 \
-        --iters 200000 \
-        --batch 262144 \
-        --stack 1000 \
-        --sb 10 \
-        --bb 20 \
+        --players "$PLAYERS" \
+        --iters "$ITERS" \
+        --batch "$BATCH" \
+        --stack "$STACK_SIZE" \
+        --sb "$SB_SIZE" \
+        --bb "$BB_SIZE" \
         --save "$OUT_BASE" \
         --handranks data/handranks.dat \
         "${LOAD_FLAG[@]}"
