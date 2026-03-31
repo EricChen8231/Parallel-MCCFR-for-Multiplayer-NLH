@@ -55,7 +55,13 @@ static void print_usage(const char* prog)
         "  --strategy  <file>                  strategy to use for the bot\n"
         "  --opponent  <type>                  scripted archetype (default: calling_station)\n"
         "  --hands     <N>                     total hands in session (default: 500)\n"
-        "  --window    <N>                     rolling BB/100 window size (default: 50)\n",
+        "  --window    <N>                     rolling BB/100 window size (default: 50)\n"
+        "\n"
+        "Human flags (--mode human):\n"
+        "  --strategy  <file>                  strategy to use for all bot seats\n"
+        "  --players   <N>                     2-9 players (seat 0 is you; default: 2)\n"
+        "  --hands     <N>                     total hands in session (default: 10000)\n"
+        "  --show-all-cards                    reveal every seat's hole cards during play\n",
         prog);
 }
 
@@ -104,6 +110,7 @@ int main(int argc, char* argv[])
     std::string opponent_str   = "calling_station";
     long long   eval_hands     = 10000;
     int         window_size    = 50;
+    bool        show_all_cards = false;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--mode")       && i+1<argc) mode          = argv[++i];
@@ -120,6 +127,7 @@ int main(int argc, char* argv[])
         else if (!strcmp(argv[i], "--opponent")   && i+1<argc) opponent_str  = argv[++i];
         else if (!strcmp(argv[i], "--hands")      && i+1<argc) eval_hands    = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--window")     && i+1<argc) window_size   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--show-all-cards"))         show_all_cards = true;
         else if (!strcmp(argv[i], "--no-cfrplus"))  use_cfr_plus   = false;
         else if (!strcmp(argv[i], "--no-lcfr"))     use_linear_cfr = false;
         else if (!strcmp(argv[i], "--help"))      { print_usage(argv[0]); return 0; }
@@ -148,7 +156,7 @@ int main(int argc, char* argv[])
         std::string strat_file = strategy_path.empty() ? save_path : strategy_path;
         printf("Eval: loading strategy from %s ...\n", strat_file.c_str());
         HostStrategyTable strat;
-        if (!strategy_load(strat, strat_file)) {
+        if (!strategy_load_auto(strat, strat_file, n_players, stack_size, sb, bb)) {
             fprintf(stderr, "ERROR: Could not load strategy from %s\n", strat_file.c_str());
             return 1;
         }
@@ -203,7 +211,7 @@ int main(int argc, char* argv[])
         std::string strat_file = strategy_path.empty() ? save_path : strategy_path;
         printf("Play: loading strategy from %s ...\n", strat_file.c_str());
         HostStrategyTable strat;
-        if (!strategy_load(strat, strat_file)) {
+        if (!strategy_load_auto(strat, strat_file, /*n_players=*/2, stack_size, sb, bb)) {
             fprintf(stderr, "ERROR: Could not load strategy from %s\n", strat_file.c_str());
             return 1;
         }
@@ -240,7 +248,7 @@ int main(int argc, char* argv[])
     }
 
     // =========================================================================
-    // HUMAN mode: CPU-only interactive heads-up session
+    // HUMAN mode: CPU-only interactive session (heads-up or multi-way)
     // =========================================================================
     if (mode == "human") {
         abstraction_init();
@@ -255,13 +263,20 @@ int main(int argc, char* argv[])
         std::string strat_file = strategy_path.empty() ? save_path : strategy_path;
         printf("Human mode: loading strategy from %s ...\n", strat_file.c_str());
         HostStrategyTable strat;
-        if (!strategy_load(strat, strat_file)) {
+        if (!strategy_load_auto(strat, strat_file, n_players, stack_size, sb, bb)) {
             fprintf(stderr, "ERROR: Could not load strategy from %s\n", strat_file.c_str());
             return 1;
         }
         printf("  Loaded %zu info sets.\n", strat.size());
 
-        play_vs_human(strat, eval_hands, stack_size, sb, bb, /*seed=*/42);
+        if (n_players < 2 || n_players > MAX_EVAL_PLAYERS) {
+            fprintf(stderr, "ERROR: --players must be between 2 and %d for human mode\n",
+                    MAX_EVAL_PLAYERS);
+            return 1;
+        }
+
+        play_vs_human(strat, n_players, eval_hands, stack_size, sb, bb,
+                      show_all_cards, /*seed=*/42);
 
 #ifdef USE_MPI
         MPI_Finalize();

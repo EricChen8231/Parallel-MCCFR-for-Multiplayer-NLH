@@ -409,22 +409,25 @@ static bool play_betting_round_np(GameNP& g, int first_to_act, int bot_player,
 // ---------------------------------------------------------------------------
 // Side-pot showdown. Returns net chips won by bot_player.
 // ---------------------------------------------------------------------------
-static int resolve_showdown_np(GameNP& g, int bot_player)
+static void compute_showdown_winnings_np(const GameNP& g,
+                                         uint16_t* ranks,
+                                         int* winnings)
 {
     int n = g.n;
 
     // Evaluate hands for all non-folded players
-    uint16_t ranks[MAX_EVAL_PLAYERS] = {};
     for (int p = 0; p < n; p++) {
+        winnings[p] = 0;
         if (!g.folded[p])
             ranks[p] = evaluate_7cards(
                 g.hole[p][0], g.hole[p][1],
                 g.community[0], g.community[1], g.community[2],
                 g.community[3], g.community[4]);
+        else
+            ranks[p] = 0;
     }
 
     // Side-pot algorithm: peel off one level of investment at a time.
-    int winnings[MAX_EVAL_PLAYERS] = {};
     int remaining[MAX_EVAL_PLAYERS];
     for (int p = 0; p < n; p++) remaining[p] = g.invested[p];
 
@@ -459,7 +462,13 @@ static int resolve_showdown_np(GameNP& g, int bot_player)
         for (int p = 0; p < n; p++)
             if (eligible[p] && ranks[p] == best) winnings[p] += share;
     }
+}
 
+static int resolve_showdown_np(GameNP& g, int bot_player)
+{
+    uint16_t ranks[MAX_EVAL_PLAYERS] = {};
+    int winnings[MAX_EVAL_PLAYERS] = {};
+    compute_showdown_winnings_np(g, ranks, winnings);
     return winnings[bot_player] - g.invested[bot_player];
 }
 
@@ -711,6 +720,67 @@ static void print_bot_action(int a, int chips, int to_call, int current_bet)
     }
 }
 
+static const char* seat_role_tag(int seat, int dealer, int n_players)
+{
+    if (n_players == 2) {
+        if (seat == dealer) return "BTN/SB";
+        if (seat == ((dealer + 1) % n_players)) return "BB";
+        return "";
+    }
+    if (seat == dealer) return "BTN";
+    if (seat == ((dealer + 1) % n_players)) return "SB";
+    if (seat == ((dealer + 2) % n_players)) return "BB";
+    return "";
+}
+
+static void print_seat_action(int seat, int a, int chips, int to_call, int current_bet)
+{
+    switch (a) {
+        case 0:
+            printf("  Seat %d folds.\n", seat);
+            break;
+        case 1:
+            printf("  Seat %d checks.\n", seat);
+            break;
+        case 2:
+            printf("  Seat %d calls %d.\n", seat, chips);
+            break;
+        case 7: {
+            const int raise_to = raise_to_from_chips(chips, to_call, current_bet);
+            printf("  Seat %d goes all-in: raises to %d (%d chips).\n",
+                   seat, raise_to, chips);
+            break;
+        }
+        default: {
+            const int raise_to = raise_to_from_chips(chips, to_call, current_bet);
+            printf("  Seat %d raises to %d (puts in %d).\n",
+                   seat, raise_to, chips);
+            break;
+        }
+    }
+}
+
+static void print_table_state_np(const GameNP& g, int human_player, int dealer,
+                                 bool show_all_cards)
+{
+    printf("  Table:\n");
+    for (int p = 0; p < g.n; p++) {
+        const char* role = seat_role_tag(p, dealer, g.n);
+        printf("    Seat %d", p);
+        if (p == human_player) printf(" (You)");
+        if (role[0] != '\0')   printf(" [%s]", role);
+        printf("  Stack: %d", g.stacks[p]);
+        if (g.folded[p]) printf("  [folded]");
+        else if (g.all_in[p]) printf("  [all-in]");
+        if (show_all_cards || p == human_player) {
+            printf("  Cards: %s %s",
+                   card_to_str(g.hole[p][0]).c_str(),
+                   card_to_str(g.hole[p][1]).c_str());
+        }
+        printf("\n");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interactive action prompt — reads from stdin, returns an abstract action
 // for history lookup plus the exact chip amount to put in.
@@ -824,7 +894,8 @@ static HumanDecision human_input_action(uint8_t vm, int pot, int stack,
 static int play_hand_human(Deck& deck, std::mt19937& rng,
                             int human_player,
                             const HostStrategyTable& strat,
-                            int starting_stack, int sb_amt, int bb_amt)
+                            int starting_stack, int sb_amt, int bb_amt,
+                            bool show_all_cards)
 {
     int bot_player = 1 - human_player;
 
@@ -894,6 +965,11 @@ static int play_hand_human(Deck& deck, std::mt19937& rng,
         printf("  Your hand: %s %s\n",
                card_to_str(g.hole[human_player][0]).c_str(),
                card_to_str(g.hole[human_player][1]).c_str());
+        if (show_all_cards) {
+            printf("  Bot hand: %s %s\n",
+                   card_to_str(g.hole[bot_player][0]).c_str(),
+                   card_to_str(g.hole[bot_player][1]).c_str());
+        }
         printf("  Stacks  You: %d  |  Bot: %d  |  Pot: %d\n",
                g.stacks[human_player], g.stacks[bot_player], g.pot);
 
@@ -1026,33 +1102,306 @@ static int play_hand_human(Deck& deck, std::mt19937& rng,
     return net;
 }
 
+static int play_hand_human_np(GameNP& g, Deck& deck, std::mt19937& rng,
+                              int human_player, int dealer,
+                              const HostStrategyTable& strat,
+                              int starting_stack, int sb_amt, int bb_amt,
+                              bool show_all_cards)
+{
+    const int n = g.n;
+
+    deck.shuffle(rng);
+    for (int p = 0; p < n; p++) {
+        g.hole[p][0] = deck.deal();
+        g.hole[p][1] = deck.deal();
+    }
+    for (int i = 0; i < 5; i++) g.community[i] = deck.deal();
+
+    for (int p = 0; p < n; p++) {
+        g.stacks[p]  = starting_stack;
+        g.bets[p]    = g.invested[p] = 0;
+        g.folded[p]  = g.all_in[p]   = false;
+    }
+    g.pot = g.current_bet = 0;
+    g.last_full_raise = bb_amt;
+    g.bb_amt = bb_amt;
+    g.action_bits = 0;
+    g.street = 0;
+
+    const int sb_pos = (n == 2) ? dealer : (dealer + 1) % n;
+    const int bb_pos = (n == 2) ? ((dealer + 1) % n) : (dealer + 2) % n;
+
+    auto post = [&](int p, int amt) {
+        const int chips = std::min(amt, g.stacks[p]);
+        g.stacks[p]  -= chips;
+        g.bets[p]     = chips;
+        g.invested[p] = chips;
+        g.pot        += chips;
+        if (!g.stacks[p]) g.all_in[p] = true;
+    };
+    post(sb_pos, sb_amt);
+    post(bb_pos, bb_amt);
+    g.current_bet = g.bets[bb_pos];
+
+    Card hole_flat[MAX_EVAL_PLAYERS * 2];
+    for (int p = 0; p < n; p++) {
+        hole_flat[p*2]   = g.hole[p][0];
+        hole_flat[p*2+1] = g.hole[p][1];
+    }
+    int hb[MAX_EVAL_PLAYERS], bb_flat[MAX_EVAL_PLAYERS * 4];
+    precompute_buckets(hole_flat, g.community, n, hb, bb_flat);
+    for (int p = 0; p < n; p++) {
+        g.hole_buckets[p] = hb[p];
+        for (int s = 0; s < 4; s++)
+            g.board_buckets[p][s] = bb_flat[p * 4 + s];
+    }
+
+    static const char* SNAMES[] = { "Preflop", "Flop", "Turn", "River" };
+    static const int   N_COMM[] = { 0, 3, 4, 5 };
+
+    for (int st = 0; st < 4; st++) {
+        g.street = st;
+        if (st > 0) {
+            for (int p = 0; p < n; p++) g.bets[p] = 0;
+            g.current_bet = 0;
+            g.last_full_raise = g.bb_amt;
+        }
+
+        int active = 0;
+        for (int p = 0; p < n; p++) if (!g.folded[p]) active++;
+        if (active <= 1) break;
+
+        const int n_comm = N_COMM[st];
+        printf("\n  --- %s ---\n", SNAMES[st]);
+        if (n_comm > 0) {
+            printf("  Board: ");
+            for (int i = 0; i < n_comm; i++) {
+                printf("%s", card_to_str(g.community[i]).c_str());
+                if (i < n_comm - 1) printf(" ");
+            }
+            printf("\n");
+        }
+        printf("  Your hand: %s %s\n",
+               card_to_str(g.hole[human_player][0]).c_str(),
+               card_to_str(g.hole[human_player][1]).c_str());
+        printf("  Pot: %d\n", g.pot);
+        print_table_state_np(g, human_player, dealer, show_all_cards);
+
+        int can_act = 0;
+        for (int p = 0; p < n; p++) if (!g.folded[p] && !g.all_in[p]) can_act++;
+        if (can_act <= 1) {
+            if (st < 3) printf("  (all-in — running board)\n");
+            if (st == 3) break;
+            continue;
+        }
+
+        int first = (st == 0) ? (bb_pos + 1) % n : (dealer + 1) % n;
+        if (st > 0) {
+            for (int i = 0; i < n; i++) {
+                const int pp = (dealer + 1 + i) % n;
+                if (!g.folded[pp] && !g.all_in[pp]) { first = pp; break; }
+            }
+        }
+
+        bool needs_to_act[MAX_EVAL_PLAYERS] = {};
+        for (int p = 0; p < n; p++)
+            needs_to_act[p] = !g.folded[p] && !g.all_in[p];
+
+        bool folded_out = false;
+        int p = first;
+        const int safety = n * n * 4;
+        for (int guard = 0; guard < safety; guard++) {
+            bool anyone = false;
+            for (int i = 0; i < n; i++) if (needs_to_act[i]) { anyone = true; break; }
+            if (!anyone) break;
+
+            if (!needs_to_act[p]) { p = (p + 1) % n; continue; }
+
+            const int to_call = g.current_bet - g.bets[p];
+            const uint8_t vm = valid_actions_mask(
+                g.pot, g.stacks[p], to_call, g.current_bet, g.last_full_raise, g.bb_amt);
+
+            int chosen = 1;
+            int chips = 0;
+            if (p == human_player) {
+                HumanDecision decision = human_input_action(
+                    vm, g.pot, g.stacks[p], to_call, g.current_bet,
+                    g.last_full_raise, g.bb_amt);
+                chosen = decision.action;
+                chips  = decision.chips;
+            } else {
+                chosen = trained_action(strat, (uint8_t)p,
+                    (uint8_t)g.hole_buckets[p],
+                    (uint8_t)g.board_buckets[p][st],
+                    (uint8_t)st, g.action_bits, vm, rng);
+                chips = legal_raise_chips_for_action(
+                    chosen, g.pot, g.stacks[p], to_call,
+                    g.current_bet, g.last_full_raise, g.bb_amt);
+                print_seat_action(p, chosen, chips, to_call, g.current_bet);
+            }
+
+            g.action_bits = ((g.action_bits << 3) | (uint32_t)chosen) & 0x3FFFFFFFu;
+            needs_to_act[p] = false;
+
+            if (chosen == 0) {
+                g.folded[p] = true;
+                int still_active = 0;
+                for (int i = 0; i < n; i++) if (!g.folded[i]) still_active++;
+                if (still_active <= 1) {
+                    folded_out = true;
+                    break;
+                }
+            } else if (chosen != 1) {
+                const int prev_bet = g.current_bet;
+                g.stacks[p]   -= chips;
+                g.bets[p]     += chips;
+                g.invested[p] += chips;
+                g.pot         += chips;
+                if (g.stacks[p] == 0) g.all_in[p] = true;
+
+                if (g.bets[p] > g.current_bet) {
+                    const int raise_size = g.bets[p] - prev_bet;
+                    if (raise_size >= g.last_full_raise || prev_bet == 0)
+                        g.last_full_raise = raise_size;
+                    g.current_bet = g.bets[p];
+                    for (int i = 0; i < n; i++)
+                        if (i != p && !g.folded[i] && !g.all_in[i])
+                            needs_to_act[i] = true;
+                }
+            }
+            p = (p + 1) % n;
+        }
+
+        if (folded_out) break;
+
+        active = 0;
+        for (int pp = 0; pp < n; pp++) if (!g.folded[pp]) active++;
+        if (active <= 1 || st == 3) break;
+    }
+
+    int last = -1, active = 0;
+    for (int p = 0; p < n; p++) if (!g.folded[p]) { last = p; active++; }
+
+    if (active == 1) {
+        if (last == human_player) {
+            printf("\n  Everyone else folds. You win the pot of %d!\n", g.pot);
+            return g.pot - g.invested[human_player];
+        }
+        printf("\n  Seat %d wins the pot of %d.\n", last, g.pot);
+        return -g.invested[human_player];
+    }
+
+    uint16_t ranks[MAX_EVAL_PLAYERS] = {};
+    int winnings[MAX_EVAL_PLAYERS] = {};
+    compute_showdown_winnings_np(g, ranks, winnings);
+
+    printf("\n  --- Showdown ---\n");
+    printf("  Board: ");
+    for (int i = 0; i < 5; i++) {
+        printf("%s", card_to_str(g.community[i]).c_str());
+        if (i < 4) printf(" ");
+    }
+    printf("\n");
+    for (int p = 0; p < n; p++) {
+        if (g.folded[p]) continue;
+        printf("  Seat %d%s: %s %s  (%s, rank=%u)",
+               p,
+               p == human_player ? " (You)" : "",
+               card_to_str(g.hole[p][0]).c_str(),
+               card_to_str(g.hole[p][1]).c_str(),
+               hand_category_name(ranks[p]),
+               (unsigned)ranks[p]);
+        if (winnings[p] > 0) printf("  collects %d", winnings[p]);
+        printf("\n");
+    }
+
+    const int net = winnings[human_player] - g.invested[human_player];
+    if (net > 0) printf("  You win chips at showdown.\n");
+    else if (net < 0) printf("  You lose chips at showdown.\n");
+    else printf("  You break even at showdown.\n");
+    return net;
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
-void play_vs_human(const HostStrategyTable& strat, long long n_hands,
-                   int starting_stack, int sb_amt, int bb_amt, unsigned seed)
+void play_vs_human(const HostStrategyTable& strat, int n_players, long long n_hands,
+                   int starting_stack, int sb_amt, int bb_amt,
+                   bool show_all_cards, unsigned seed)
 {
     std::mt19937 rng(seed);
     Deck deck;
     long long total_chips  = 0;
     long long hands_played = 0;
 
+    if (n_players <= 2) {
+        printf("\n================================================================\n");
+        printf("  Human vs Bot  |  Stack: %d  |  Blinds: %d/%d  |  Hands: %lld\n",
+               starting_stack, sb_amt, bb_amt, n_hands);
+        printf("  Cards:   2-9 T J Q K A   suits: c d h s\n");
+        printf("  Actions: [f]old  [k]heck  [c]all  [3]/[4]/[6]=preset raises  [r N]=raise to N  [a]ll-in\n");
+        printf("================================================================\n");
+
+        for (long long h = 0; h < n_hands; h++) {
+            int human_player = (int)(h & 1);   // alternate SB/BB each hand
+            printf("\n[ Hand %lld  |  You: %s  |  Bot: %s ]\n",
+                   h + 1,
+                   human_player == 0 ? "SB" : "BB",
+                   human_player == 0 ? "BB" : "SB");
+
+            int net = play_hand_human(deck, rng, human_player, strat,
+                                      starting_stack, sb_amt, bb_amt,
+                                      show_all_cards);
+            total_chips  += net;
+            hands_played++;
+
+            double net_bb = (double)total_chips / (double)bb_amt;
+            double bb100  = net_bb / (double)hands_played * 100.0;
+            printf("\n  Hand result: %+d chips  |  Total: %+.1f BB  |  BB/100: %+.2f\n",
+                   net, net_bb, bb100);
+
+            if (h + 1 < n_hands) {
+                printf("  [Enter = next hand, q = quit] ");
+                fflush(stdout);
+                char buf[8];
+                if (!fgets(buf, sizeof(buf), stdin) || buf[0] == 'q' || buf[0] == 'Q')
+                    break;
+            }
+        }
+
+        double net_bb = (double)total_chips / (double)bb_amt;
+        printf("\n================================================================\n");
+        printf("  Session: %lld hands  |  Net: %+.1f BB  |  BB/100: %+.2f\n",
+               hands_played, net_bb,
+               hands_played > 0 ? net_bb / (double)hands_played * 100.0 : 0.0);
+        printf("================================================================\n");
+        return;
+    }
+
     printf("\n================================================================\n");
-    printf("  Human vs Bot  |  Stack: %d  |  Blinds: %d/%d  |  Hands: %lld\n",
-           starting_stack, sb_amt, bb_amt, n_hands);
+    printf("  Human vs Bots  |  Players: %d  |  You: Seat 0  |  Stack: %d  |  Blinds: %d/%d  |  Hands: %lld\n",
+           n_players, starting_stack, sb_amt, bb_amt, n_hands);
     printf("  Cards:   2-9 T J Q K A   suits: c d h s\n");
     printf("  Actions: [f]old  [k]heck  [c]all  [3]/[4]/[6]=preset raises  [r N]=raise to N  [a]ll-in\n");
     printf("================================================================\n");
 
+    GameNP g;
+    g.n = n_players;
     for (long long h = 0; h < n_hands; h++) {
-        int human_player = (int)(h & 1);   // alternate SB/BB each hand
-        printf("\n[ Hand %lld  |  You: %s  |  Bot: %s ]\n",
-               h + 1,
-               human_player == 0 ? "SB" : "BB",
-               human_player == 0 ? "BB" : "SB");
+        const int human_player = 0;
+        const int dealer = (int)(h % n_players);
+        const char* role = seat_role_tag(human_player, dealer, n_players);
+        if (role[0] != '\0') {
+            printf("\n[ Hand %lld  |  You: Seat %d [%s]  |  Dealer: Seat %d ]\n",
+                   h + 1, human_player, role, dealer);
+        } else {
+            printf("\n[ Hand %lld  |  You: Seat %d  |  Dealer: Seat %d ]\n",
+                   h + 1, human_player, dealer);
+        }
 
-        int net = play_hand_human(deck, rng, human_player, strat,
-                                  starting_stack, sb_amt, bb_amt);
+        int net = play_hand_human_np(g, deck, rng, human_player, dealer, strat,
+                                     starting_stack, sb_amt, bb_amt,
+                                     show_all_cards);
         total_chips  += net;
         hands_played++;
 

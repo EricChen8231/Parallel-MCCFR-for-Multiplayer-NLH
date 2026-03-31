@@ -55,7 +55,7 @@ EvalResult evaluate_strategy(
 //
 // n_players must be in [2, 9]. Training was done for up to 6 players;
 // strategy lookups for positions beyond the training player count fall back
-// to uniform-random action.
+// to a passive legal action.
 // ---------------------------------------------------------------------------
 constexpr int MAX_EVAL_PLAYERS = 9;
 
@@ -72,8 +72,9 @@ EvalResult evaluate_strategy_np(
 // ---------------------------------------------------------------------------
 // play_vs_human
 //
-// Interactive heads-up session: human vs. trained bot.
-// Positions (SB/BB) alternate every hand. Dealer rotates.
+// Interactive session: human vs. trained bots.
+// For 2 players, this is heads-up. For 3-9 players, seat 0 is the human and
+// the remaining seats are controlled by the trained strategy. Dealer rotates.
 //
 // Cards displayed as: 2-9, T, J, Q, K, A  x  c d h s
 // Actions entered via stdin:
@@ -84,8 +85,10 @@ EvalResult evaluate_strategy_np(
 // ---------------------------------------------------------------------------
 void play_vs_human(
     const HostStrategyTable& strat,
+    int                      n_players = 2,
     long long                n_hands = 50,
     int                      stack   = 1000,
     int                      sb      = 10,
     int                      bb      = 20,
+    bool                     show_all_cards = false,
     unsigned                 seed    = 42);
