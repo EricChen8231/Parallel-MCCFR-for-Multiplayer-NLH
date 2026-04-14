@@ -35,8 +35,10 @@ static void print_usage(const char* prog)
         "  --save     <file>              (default: strategy.bin)\n"
         "  --load     <file>\n"
         "  --handranks <file>             (default: data/handranks.dat)\n"
-        "  --no-cfrplus                   disable CFR+ clamping\n"
-        "  --no-lcfr                      disable Linear CFR weighting\n",
+        "  --no-cfrplus                   disable CFR+ clamping (default: on)\n"
+        "  --cfrplus                      enable CFR+ clamping (default: on)\n"
+        "  --no-lcfr                      disable Linear CFR weighting (default: on)\n"
+        "  --lcfr                         enable Linear CFR weighting (default: on)\n",
         prog);
 }
 
@@ -91,7 +93,9 @@ int main(int argc, char* argv[])
         else if (!strcmp(argv[i], "--load")       && i+1<argc) load_path  = argv[++i];
         else if (!strcmp(argv[i], "--handranks")  && i+1<argc) hr_path    = argv[++i];
         else if (!strcmp(argv[i], "--no-cfrplus"))  use_cfr_plus   = false;
+        else if (!strcmp(argv[i], "--cfrplus"))     use_cfr_plus   = true;
         else if (!strcmp(argv[i], "--no-lcfr"))     use_linear_cfr = false;
+        else if (!strcmp(argv[i], "--lcfr"))        use_linear_cfr = true;
         else if (!strcmp(argv[i], "--help"))      { print_usage(argv[0]); return 0; }
     }
 
@@ -132,18 +136,27 @@ int main(int argc, char* argv[])
 
         printf("\nInfo sets active: %d\n", trainer.num_info_sets_active());
 
-        // Save checkpoint (raw regrets + strategy_sum for resuming)
-        std::string ckpt = save_path + ".ckpt";
-        if (trainer.save_checkpoint(ckpt))
-            printf("Checkpoint saved to %s\n", ckpt.c_str());
+#ifdef USE_MPI
+        // In MPI mode, only rank 0 writes output files.
+        // All ranks reaching here simultaneously with the same path causes a race
+        // condition: the last writer wins and both files can be corrupted.
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (mpi_rank == 0)
+#endif
+        {
+            // Save checkpoint (raw regrets + strategy_sum for resuming)
+            std::string ckpt = save_path + ".ckpt";
+            if (trainer.save_checkpoint(ckpt))
+                printf("Checkpoint saved to %s\n", ckpt.c_str());
 
-        // Save normalized average strategy
-        auto strat = trainer.get_strategy();
-        if (strategy_save(strat, save_path))
-            printf("Strategy saved to %s  (%zu info sets)\n",
-                   save_path.c_str(), strat.size());
-        else
-            fprintf(stderr, "ERROR: could not save strategy to %s\n", save_path.c_str());
+            // Save normalized average strategy
+            auto strat = trainer.get_strategy();
+            if (strategy_save(strat, save_path))
+                printf("Strategy saved to %s  (%zu info sets)\n",
+                       save_path.c_str(), strat.size());
+            else
+                fprintf(stderr, "ERROR: could not save strategy to %s\n", save_path.c_str());
+        }
     }
     // -------------------------------------------------------------------------
     else if (mode == "benchmark") {
