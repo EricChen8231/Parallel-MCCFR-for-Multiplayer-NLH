@@ -10,12 +10,21 @@ set(CMAKE_CUDA_STANDARD 17)
 #   80 = A100 (CARC Discovery)
 #   86 = RTX 30xx (local dev)
 # ---------------------------------------------------------------------------
-set(CMAKE_CUDA_ARCHITECTURES "70;80;86" CACHE STRING "CUDA compute capabilities")
+set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89" CACHE STRING "CUDA compute capabilities")
+# 70 = V100  (CARC Discovery)
+# 75 = RTX 20xx / GTX 16xx  (Turing — common laptop GPU)
+# 80 = A100  (CARC Discovery)
+# 86 = RTX 30xx  (Ampere — common laptop GPU)
+# 89 = RTX 40xx  (Ada Lovelace — newer laptops)
 
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS_RELEASE  "-O3 -DNDEBUG")
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_RELEASE  "/O2 /DNDEBUG")
+else()
+    set(CMAKE_CXX_FLAGS_RELEASE  "-O3 -DNDEBUG")
+endif()
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math -DNDEBUG")
 set(CMAKE_CUDA_FLAGS         "${CMAKE_CUDA_FLAGS} -lineinfo")   # for Nsight
 

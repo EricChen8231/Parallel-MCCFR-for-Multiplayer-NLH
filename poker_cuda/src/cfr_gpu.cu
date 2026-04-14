@@ -1271,18 +1271,41 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
         if (verbose && iter % 100 == 0) {
             CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
             auto t1 = std::chrono::high_resolution_clock::now();
-            double sec = std::chrono::duration<double>(t1 - t0).count();
+            double sec  = std::chrono::duration<double>(t1 - t0).count();
             long long hands_done = iter * (long long)batch_size * N_;
-            printf("  iter %lld/%lld  hands=%.0fM  speed=%.1fM/s\n",
+            double mhps = hands_done / sec / 1e6;
+
+            // ETA in seconds (linear extrapolation from elapsed time)
+            double eta_sec = (sec / (double)iter) * (double)(total_iterations - iter);
+            int eta_h = (int)(eta_sec / 3600);
+            int eta_m = (int)(eta_sec / 60) % 60;
+            int eta_s = (int)(eta_sec) % 60;
+
+            // 40-character ASCII progress bar
+            constexpr int BAR_WIDTH = 40;
+            double frac = (double)iter / (double)total_iterations;
+            int filled = (int)(frac * BAR_WIDTH);
+            char bar[BAR_WIDTH + 1];
+            for (int i = 0; i < BAR_WIDTH; i++)
+                bar[i] = (i < filled) ? '#' : '-';
+            bar[BAR_WIDTH] = '\0';
+
+            // \r overwrites the same line; fflush ensures it appears immediately
+            printf("\r  [%s] %3d%%  %lld/%lld iters  %.1fM hands/s  ETA %d:%02d:%02d  ",
+                   bar, (int)(frac * 100 + 0.5),
                    iter, total_iterations,
-                   hands_done / 1e6,
-                   hands_done / sec / 1e6);
+                   mhps,
+                   eta_h, eta_m, eta_s);
+            fflush(stdout);
         }
 
         if (!ckpt_path.empty() && ckpt_interval > 0 && iter % ckpt_interval == 0 && iter > 0) {
             CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-            if (save_checkpoint(ckpt_path))
-                printf("  [checkpoint saved at iter %lld -> %s]\n", iter, ckpt_path.c_str());
+            if (save_checkpoint(ckpt_path)) {
+                // Print checkpoint message on its own line (don't overwrite the bar)
+                printf("\n  [checkpoint -> %s]\n", ckpt_path.c_str());
+                fflush(stdout);
+            }
         }
     }
 
@@ -1291,6 +1314,8 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
     auto t1 = std::chrono::high_resolution_clock::now();
     double sec = std::chrono::duration<double>(t1 - t0).count();
     long long total_hands = total_iterations * (long long)batch_size * N_;
+    // End the progress bar line, then print the summary on a fresh line
+    if (verbose) printf("\n");
     printf("Done: %.0fM hands in %.2fs (%.1fM hands/sec)\n",
            total_hands / 1e6, sec, total_hands / sec / 1e6);
 }
