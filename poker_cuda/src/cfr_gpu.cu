@@ -89,26 +89,8 @@ static __device__ __forceinline__ int sm_to_rm(uint8_t c)
     return (int)(c % 13) * 4 + (int)(c / 13) + 1;
 }
 
-static __device__ __forceinline__ uint16_t
-decode_packed_rank_gpu(uint16_t packed)
-{
-    const uint16_t cat = packed >> 12;
-    const uint16_t ordinal = packed & 0x0FFFu;
-    if (ordinal == 0) return 0;
-    switch (cat) {
-        case 1: return ordinal;
-        case 2: return (uint16_t)(1277 + ordinal);
-        case 3: return (uint16_t)(4137 + ordinal);
-        case 4: return (uint16_t)(4995 + ordinal);
-        case 5: return (uint16_t)(5853 + ordinal);
-        case 6: return (uint16_t)(5863 + ordinal);
-        case 7: return (uint16_t)(7140 + ordinal);
-        case 8: return (uint16_t)(7296 + ordinal);
-        case 9: return (uint16_t)(7452 + ordinal);
-        default: return 0;
-    }
-}
-
+// Standard Two Plus Two table returns raw ranks 1-7462 at terminal nodes
+// (higher = better hand). No packed decoding needed.
 static __device__ __forceinline__ uint16_t
 eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
 {
@@ -116,7 +98,7 @@ eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
     p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c4)]));
+    return (uint16_t)__ldg(&g_hr[p + sm_to_rm(c4)]);
 }
 
 // Two Plus Two supports sequential 7-card lookup in exactly 7 steps — no
@@ -131,7 +113,7 @@ eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c5)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c6)]));
+    return (uint16_t)__ldg(&g_hr[p + sm_to_rm(c6)]);
 }
 
 // 6-card sequential lookup for turn evaluation (2 hole + 4 community).
@@ -144,7 +126,7 @@ eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c5)]));
+    return (uint16_t)__ldg(&g_hr[p + sm_to_rm(c5)]);
 }
 
 // ---------------------------------------------------------------------------

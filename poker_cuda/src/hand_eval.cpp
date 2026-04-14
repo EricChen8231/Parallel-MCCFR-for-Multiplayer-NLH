@@ -12,18 +12,6 @@
 static std::vector<int32_t> HR;
 
 static constexpr size_t EXPECTED_HR_ENTRIES = 32487834u;
-static constexpr uint16_t CATEGORY_BASE[10] = {
-    0,    // unused
-    0,    // high card
-    1277, // pair
-    4137, // two pair
-    4995, // trips
-    5853, // straight
-    5863, // flush
-    7140, // full house
-    7296, // quads
-    7452  // straight flush
-};
 
 // ---------------------------------------------------------------------------
 // Card encoding conversion: project uses suit-major (card = suit*13 + rank,
@@ -50,13 +38,6 @@ static uint16_t eval7_from_table(const std::vector<int32_t>& hr,
     return (uint16_t)hr[p + to_rm(c6)];
 }
 
-static inline uint16_t decode_packed_rank(uint16_t packed) {
-    const uint16_t cat = packed >> 12;
-    const uint16_t ordinal = packed & 0x0FFFu;
-    if (cat < 1 || cat > 9 || ordinal == 0) return 0;
-    return (uint16_t)(CATEGORY_BASE[cat] + ordinal);
-}
-
 static bool validate_hand_table(const std::vector<int32_t>& hr, const char* path) {
     if (hr.size() != EXPECTED_HR_ENTRIES) {
         fprintf(stderr,
@@ -66,17 +47,19 @@ static bool validate_hand_table(const std::vector<int32_t>& hr, const char* path
         return false;
     }
 
-    const uint16_t royal = decode_packed_rank(eval7_from_table(
+    // Standard Two Plus Two table returns raw ranks 1-7462 (higher = better).
+    // Royal flush (As Ks Qs Js Ts + 2 irrelevant cards) must evaluate to 7462.
+    const uint16_t royal = eval7_from_table(
         hr,
         /*As*/ 51, /*Ks*/ 50, /*Qs*/ 49, /*Js*/ 48,
-        /*Ts*/ 47, /*2c*/ 0,  /*3d*/ 14));
+        /*Ts*/ 47, /*2c*/ 0,  /*3d*/ 14);
 
     if (royal != 7462) {
         fprintf(stderr,
                 "[hand_eval] incompatible handranks table at %s:\n"
-                "            As Ks Qs Js Ts 2c 3d decoded to %u, expected 7462.\n"
-                "            This code assumes the classic tangentforks/TwoPlusTwo\n"
-                "            packed HandRanks.dat format decodable to [1..7462].\n",
+                "            As Ks Qs Js Ts 2c 3d evaluated to %u, expected 7462.\n"
+                "            Ensure you are using the standard Two Plus Two HandRanks.dat\n"
+                "            (32,487,834 int32 entries, ~130 MB).\n",
                 path, (unsigned)royal);
         return false;
     }
@@ -108,7 +91,7 @@ static inline uint16_t eval5(Card c0, Card c1, Card c2, Card c3, Card c4) {
     p = HR[p  + to_rm(c1)];
     p = HR[p  + to_rm(c2)];
     p = HR[p  + to_rm(c3)];
-    return decode_packed_rank((uint16_t)HR[p + to_rm(c4)]);
+    return (uint16_t)HR[p + to_rm(c4)];
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +105,7 @@ static inline uint16_t eval6(Card c0, Card c1, Card c2,
     p = HR[p  + to_rm(c2)];
     p = HR[p  + to_rm(c3)];
     p = HR[p  + to_rm(c4)];
-    return decode_packed_rank((uint16_t)HR[p + to_rm(c5)]);
+    return (uint16_t)HR[p + to_rm(c5)];
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +121,7 @@ uint16_t evaluate_7cards(Card c0, Card c1, Card c2,
     p = HR[p  + to_rm(c3)];
     p = HR[p  + to_rm(c4)];
     p = HR[p  + to_rm(c5)];
-    return decode_packed_rank((uint16_t)HR[p + to_rm(c6)]);
+    return (uint16_t)HR[p + to_rm(c6)];
 }
 
 // ---------------------------------------------------------------------------
