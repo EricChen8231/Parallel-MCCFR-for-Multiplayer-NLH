@@ -1,9 +1,8 @@
 #include "hand_eval.h"
+#include <cstdio>
 #include <fstream>
 #include <vector>
 #include <cstring>
-#include <stdexcept>
-#include <algorithm>
 #include <cassert>
 
 // ---------------------------------------------------------------------------
@@ -12,6 +11,79 @@
 // ---------------------------------------------------------------------------
 static std::vector<int32_t> HR;
 
+static constexpr size_t EXPECTED_HR_ENTRIES = 32487834u;
+static constexpr uint16_t CATEGORY_BASE[10] = {
+    0,    // unused
+    0,    // high card
+    1277, // pair
+    4137, // two pair
+    4995, // trips
+    5853, // straight
+    5863, // flush
+    7140, // full house
+    7296, // quads
+    7452  // straight flush
+};
+
+// ---------------------------------------------------------------------------
+// Card encoding conversion: project uses suit-major (card = suit*13 + rank,
+// 0-based), but the classic Two Plus Two table uses rank-major
+// (card = rank*4 + suit, 1-based).
+//   suit-major: 2c=0, 3c=1, ..., Ac=12, 2d=13, ..., As=51
+//   rank-major: 2c=1, 2d=2, 2h=3, 2s=4, 3c=5, ..., As=52
+// ---------------------------------------------------------------------------
+static inline int to_rm(Card c) {
+    int rank = c % 13;   // 0=2, 1=3, ..., 12=A
+    int suit = c / 13;   // 0=clubs, 1=diamonds, 2=hearts, 3=spades
+    return rank * 4 + suit + 1;
+}
+
+static uint16_t eval7_from_table(const std::vector<int32_t>& hr,
+                                 Card c0, Card c1, Card c2,
+                                 Card c3, Card c4, Card c5, Card c6) {
+    int p = hr[53 + to_rm(c0)];
+    p = hr[p  + to_rm(c1)];
+    p = hr[p  + to_rm(c2)];
+    p = hr[p  + to_rm(c3)];
+    p = hr[p  + to_rm(c4)];
+    p = hr[p  + to_rm(c5)];
+    return (uint16_t)hr[p + to_rm(c6)];
+}
+
+static inline uint16_t decode_packed_rank(uint16_t packed) {
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (cat < 1 || cat > 9 || ordinal == 0) return 0;
+    return (uint16_t)(CATEGORY_BASE[cat] + ordinal);
+}
+
+static bool validate_hand_table(const std::vector<int32_t>& hr, const char* path) {
+    if (hr.size() != EXPECTED_HR_ENTRIES) {
+        fprintf(stderr,
+                "[hand_eval] incompatible handranks table at %s:\n"
+                "            expected %zu int32 entries, found %zu.\n",
+                path, EXPECTED_HR_ENTRIES, hr.size());
+        return false;
+    }
+
+    const uint16_t royal = decode_packed_rank(eval7_from_table(
+        hr,
+        /*As*/ 51, /*Ks*/ 50, /*Qs*/ 49, /*Js*/ 48,
+        /*Ts*/ 47, /*2c*/ 0,  /*3d*/ 14));
+
+    if (royal != 7462) {
+        fprintf(stderr,
+                "[hand_eval] incompatible handranks table at %s:\n"
+                "            As Ks Qs Js Ts 2c 3d decoded to %u, expected 7462.\n"
+                "            This code assumes the classic tangentforks/TwoPlusTwo\n"
+                "            packed HandRanks.dat format decodable to [1..7462].\n",
+                path, (unsigned)royal);
+        return false;
+    }
+
+    return true;
+}
+
 bool hand_eval_init(const char* path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) return false;
@@ -19,37 +91,54 @@ bool hand_eval_init(const char* path) {
     f.seekg(0, std::ios::beg);
     HR.resize(sz / sizeof(int32_t));
     f.read(reinterpret_cast<char*>(HR.data()), sz);
-    return (bool)f;
+    if (!(bool)f) return false;
+    if (!validate_hand_table(HR, path)) {
+        HR.clear();
+        return false;
+    }
+    fprintf(stderr, "[hand_eval] loaded %zu entries (%.1f MB)\n", HR.size(), sz / 1e6);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Core 5-card evaluation (5 table lookups)
+// Core 5-card evaluation (5 sequential Two Plus Two lookups)
 // ---------------------------------------------------------------------------
 static inline uint16_t eval5(Card c0, Card c1, Card c2, Card c3, Card c4) {
-    int p = HR[53 + c0 + 1];
-    p = HR[p  + c1 + 1];
-    p = HR[p  + c2 + 1];
-    p = HR[p  + c3 + 1];
-    return (uint16_t)HR[p + c4 + 1];
+    int p = HR[53 + to_rm(c0)];
+    p = HR[p  + to_rm(c1)];
+    p = HR[p  + to_rm(c2)];
+    p = HR[p  + to_rm(c3)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c4)]);
 }
 
 // ---------------------------------------------------------------------------
-// 7-card: iterate all C(7,5)=21 five-card combos, return max rank
+// 6-card evaluation (6 sequential lookups — same entry point as eval5/eval7)
+// Best 5-card hand from exactly 6 cards; avoids the C(6,5)=6 brute-force.
+// ---------------------------------------------------------------------------
+static inline uint16_t eval6(Card c0, Card c1, Card c2,
+                              Card c3, Card c4, Card c5) {
+    int p = HR[53 + to_rm(c0)];
+    p = HR[p  + to_rm(c1)];
+    p = HR[p  + to_rm(c2)];
+    p = HR[p  + to_rm(c3)];
+    p = HR[p  + to_rm(c4)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c5)]);
+}
+
+// ---------------------------------------------------------------------------
+// 7-card: sequential 7-step Two Plus Two lookup.
+// The table supports evaluating N cards (N=5,6,7) by chaining N lookups;
+// the final entry gives the rank of the best 5-card hand.
 // ---------------------------------------------------------------------------
 uint16_t evaluate_7cards(Card c0, Card c1, Card c2,
                           Card c3, Card c4, Card c5, Card c6) {
-    Card hand[7] = {c0, c1, c2, c3, c4, c5, c6};
-    uint16_t best = 0;
-    // Generate all 21 combos of 5 from 7
-    for (int i = 0; i < 7 - 4; i++)
-    for (int j = i+1; j < 7 - 3; j++)
-    for (int k = j+1; k < 7 - 2; k++)
-    for (int l = k+1; l < 7 - 1; l++)
-    for (int m = l+1; m < 7;     m++) {
-        uint16_t v = eval5(hand[i], hand[j], hand[k], hand[l], hand[m]);
-        if (v > best) best = v;
-    }
-    return best;
+    int p = HR[53 + to_rm(c0)];
+    p = HR[p  + to_rm(c1)];
+    p = HR[p  + to_rm(c2)];
+    p = HR[p  + to_rm(c3)];
+    p = HR[p  + to_rm(c4)];
+    p = HR[p  + to_rm(c5)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c6)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,16 +153,11 @@ uint16_t evaluate_best(Card h0, Card h1,
             community[3], community[4]);
     }
     if (n_comm == 4) {
-        uint16_t best = 0;
-        for (int skip = 0; skip < 4; skip++) {
-            Card c[5];
-            int ci = 0;
-            c[ci++] = h0; c[ci++] = h1;
-            for (int i = 0; i < 4; i++) if (i != skip) c[ci++] = community[i];
-            uint16_t v = eval5(c[0], c[1], c[2], c[3], c[4]);
-            if (v > best) best = v;
-        }
-        return best;
+        // Best 5 from 6 cards (2 hole + 4 community) via sequential 6-card lookup.
+        // The old 4-combo loop skipped combinations where a hole card is excluded
+        // (e.g. using only 1 hole card + all 4 community), missing 2 of C(6,5)=6.
+        return eval6(h0, h1,
+                     community[0], community[1], community[2], community[3]);
     }
     if (n_comm == 3) {
         // Best 5 from 5 cards
@@ -107,14 +191,24 @@ void precompute_ranks(const Card* hole_cards,
 }
 
 const char* hand_category(uint16_t rank) {
-    if (rank > 6185) return "Royal Flush";
-    if (rank > 5853) return "Straight Flush";
-    if (rank > 5853 - 156) return "Four of a Kind";
-    if (rank > 5853 - 156 - 156) return "Full House";
-    if (rank > 1277 + 1135 + 858 + 858) return "Flush";
-    if (rank > 1277 + 1135 + 858) return "Straight";
-    if (rank > 1277 + 1135) return "Three of a Kind";
-    if (rank > 1277) return "Two Pair";
-    if (rank > 10) return "One Pair";
+    // Two Plus Two rank distribution [1..7462]:
+    //   High Card:         1 – 1277   (1277 ranks)
+    //   One Pair:       1278 – 4137   (2860 ranks)
+    //   Two Pair:       4138 – 4995   ( 858 ranks)
+    //   Three of a Kind:4996 – 5853   ( 858 ranks)
+    //   Straight:       5854 – 5863   (  10 ranks)
+    //   Flush:          5864 – 7140   (1277 ranks)
+    //   Full House:     7141 – 7296   ( 156 ranks)
+    //   Four of a Kind: 7297 – 7452   ( 156 ranks)
+    //   Straight Flush: 7453 – 7462   (  10 ranks)
+    if (rank >= 7462) return "Royal Flush";
+    if (rank >= 7453) return "Straight Flush";
+    if (rank >= 7297) return "Four of a Kind";
+    if (rank >= 7141) return "Full House";
+    if (rank >= 5864) return "Flush";
+    if (rank >= 5854) return "Straight";
+    if (rank >= 4996) return "Three of a Kind";
+    if (rank >= 4138) return "Two Pair";
+    if (rank >= 1278) return "One Pair";
     return "High Card";
 }

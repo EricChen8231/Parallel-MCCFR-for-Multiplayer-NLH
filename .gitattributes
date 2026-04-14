@@ -1,0 +1,9 @@
+# Force LF line endings for shell scripts on all platforms
+*.sh        text eol=lf
+
+# Keep CRLF for Windows-specific files
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+# Auto-detect everything else
+*           text=auto

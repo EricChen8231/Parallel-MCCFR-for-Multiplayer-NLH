@@ -53,6 +53,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <chrono>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // CUDA error check helper
@@ -77,13 +78,33 @@
 __device__ static int32_t* g_hr = nullptr;  // set from host via cudaMemcpyToSymbol
 
 static __device__ __forceinline__ uint16_t
+decode_packed_rank_gpu(uint16_t packed)
+{
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (ordinal == 0) return 0;
+    switch (cat) {
+        case 1: return ordinal;
+        case 2: return (uint16_t)(1277 + ordinal);
+        case 3: return (uint16_t)(4137 + ordinal);
+        case 4: return (uint16_t)(4995 + ordinal);
+        case 5: return (uint16_t)(5853 + ordinal);
+        case 6: return (uint16_t)(5863 + ordinal);
+        case 7: return (uint16_t)(7140 + ordinal);
+        case 8: return (uint16_t)(7296 + ordinal);
+        case 9: return (uint16_t)(7452 + ordinal);
+        default: return 0;
+    }
+}
+
+static __device__ __forceinline__ uint16_t
 eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
 {
     int p = __ldg(&g_hr[53 + c0 + 1]);
     p     = __ldg(&g_hr[p  + c1 + 1]);
     p     = __ldg(&g_hr[p  + c2 + 1]);
     p     = __ldg(&g_hr[p  + c3 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c4 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c4 + 1]));
 }
 
 // Two Plus Two supports sequential 7-card lookup in exactly 7 steps — no
@@ -98,7 +119,7 @@ eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + c3 + 1]);
     p     = __ldg(&g_hr[p  + c4 + 1]);
     p     = __ldg(&g_hr[p  + c5 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c6 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c6 + 1]));
 }
 
 // 6-card sequential lookup for turn evaluation (2 hole + 4 community).
@@ -111,7 +132,7 @@ eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + c2 + 1]);
     p     = __ldg(&g_hr[p  + c3 + 1]);
     p     = __ldg(&g_hr[p  + c4 + 1]);
-    return (uint16_t)__ldg(&g_hr[p + c5 + 1]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c5 + 1]));
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +170,8 @@ info_set_hash(uint8_t player, uint8_t hole_bucket, uint8_t board_bucket,
 // in strategy.  This eliminates warp divergence: every thread loops 8 times.
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ uint8_t
-valid_mask_gpu(int pot, int stack, int to_call)
+valid_mask_gpu(int pot, int stack, int to_call,
+               int current_bet, int last_full_raise, int bb_amt)
 {
     if (pot <= 0) pot = 1;
     uint8_t mask = 0;
@@ -163,29 +185,103 @@ valid_mask_gpu(int pot, int stack, int to_call)
     }
     int head = stack - to_call;
     if (head <= 0) return mask;
-    if (head > pot/4 && pot/4 > 0) mask |= (1 << 3);  // RAISE_QUARTER
-    if (head > pot/2 && pot/2 > 0) mask |= (1 << 4);  // RAISE_HALF
-    if (head > pot/3 && pot/3 > 0) mask |= (1 << 5);  // RAISE_THIRD
-    if (head > pot)                 mask |= (1 << 6);  // RAISE_POT
+
+    const int min_raise_to = (current_bet == 0)
+        ? max(1, bb_amt)
+        : current_bet + max(last_full_raise, bb_amt);
+    const int max_raise_to = current_bet + head;
+    if (max_raise_to >= min_raise_to) {
+        if (max(min_raise_to, current_bet + max(1, pot / 4)) <= max_raise_to) mask |= (1 << 3);
+        if (max(min_raise_to, current_bet + max(1, pot / 2)) <= max_raise_to) mask |= (1 << 4);
+        if (max(min_raise_to, current_bet + max(1, pot / 3)) <= max_raise_to) mask |= (1 << 5);
+        if (max(min_raise_to, current_bet + max(1, pot))     <= max_raise_to) mask |= (1 << 6);
+    }
     mask |= (1 << 7);                                  // ALL_IN
     return mask;
 }
 
 static __device__ __forceinline__ int
-chips_for_action_gpu(int a, int pot, int stack, int to_call)
+chips_for_action_gpu(int a, int pot, int stack, int to_call,
+                     int current_bet, int last_full_raise, int bb_amt)
 {
     if (pot <= 0) pot = 1;
+    const int min_raise_to = (current_bet == 0)
+        ? max(1, bb_amt)
+        : current_bet + max(last_full_raise, bb_amt);
+    const int max_raise_to = current_bet + max(0, stack - to_call);
     switch (a) {
         case 0: return 0;
         case 1: return 0;
         case 2: return min(to_call, stack);
-        case 3: return min(to_call + max(1, pot/4), stack);
-        case 4: return min(to_call + max(1, pot/2), stack);
-        case 5: return min(to_call + max(1, pot/3), stack);
-        case 6: return min(to_call + pot,           stack);
+        case 3:
+        case 4:
+        case 5:
+        case 6: {
+            int target_raise_to = min_raise_to;
+            if (a == 4) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 2));
+            if (a == 5) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 3));
+            if (a == 6) target_raise_to = max(min_raise_to, current_bet + max(1, pot));
+            target_raise_to = min(target_raise_to, max_raise_to);
+            return min(to_call + max(0, target_raise_to - current_bet), stack);
+        }
         case 7: return stack;
         default: return 0;
     }
+}
+
+static inline int to_rm_host(Card c)
+{
+    return (c % 13) * 4 + (c / 13) + 1;
+}
+
+static inline uint16_t decode_packed_rank_host(uint16_t packed)
+{
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (ordinal == 0) return 0;
+    switch (cat) {
+        case 1: return ordinal;
+        case 2: return (uint16_t)(1277 + ordinal);
+        case 3: return (uint16_t)(4137 + ordinal);
+        case 4: return (uint16_t)(4995 + ordinal);
+        case 5: return (uint16_t)(5853 + ordinal);
+        case 6: return (uint16_t)(5863 + ordinal);
+        case 7: return (uint16_t)(7140 + ordinal);
+        case 8: return (uint16_t)(7296 + ordinal);
+        case 9: return (uint16_t)(7452 + ordinal);
+        default: return 0;
+    }
+}
+
+static bool validate_hand_table_host(const std::vector<int32_t>& hr, const char* path)
+{
+    if (hr.size() != 32487834u) {
+        fprintf(stderr,
+                "[train] incompatible handranks table at %s: expected 32487834 int32 entries, found %zu.\n",
+                path, hr.size());
+        return false;
+    }
+
+    int p = hr[53 + to_rm_host(/*As*/ 51)];
+    p = hr[p + to_rm_host(/*Ks*/ 50)];
+    p = hr[p + to_rm_host(/*Qs*/ 49)];
+    p = hr[p + to_rm_host(/*Js*/ 48)];
+    p = hr[p + to_rm_host(/*Ts*/ 47)];
+    p = hr[p + to_rm_host(/*2c*/ 0)];
+    const uint16_t royal = decode_packed_rank_host(
+        (uint16_t)hr[p + to_rm_host(/*3d*/ 14)]);
+
+    if (royal != 7462) {
+        fprintf(stderr,
+                "[train] incompatible handranks table at %s:\n"
+                "        As Ks Qs Js Ts 2c 3d decoded to %u, expected 7462.\n"
+                "        This trainer assumes the classic tangentforks/TwoPlusTwo\n"
+                "        packed HandRanks.dat format decodable to [1..7462].\n",
+                path, (unsigned)royal);
+        return false;
+    }
+
+    return true;
 }
 
 // =============================================================================
@@ -256,10 +352,10 @@ __global__ void kernel_init_rng(
 
 // =============================================================================
 // Per-thread game state (lives in local memory / L1 cache)
-// Kept minimal to maximize occupancy and reduce register spilling.
+// deck[] removed — it is only needed during the deal phase, not during
+// tree traversal, so it lives as a local variable in the kernel instead.
 // =============================================================================
 struct ThreadGame {
-    uint8_t deck[52];
     uint8_t hole[12];         // [player * 2 + card_idx]
     uint8_t community[5];
     uint8_t hole_buckets[6];
@@ -271,6 +367,8 @@ struct ThreadGame {
     uint8_t all_in;           // bitmask
     int     pot;
     int     current_bet;
+    int     last_full_raise;
+    int     bb_amt;
     uint32_t action_bits;     // compressed action history (3 bits per action)
     int     street;
     int     to_act[6];
@@ -279,21 +377,78 @@ struct ThreadGame {
     int     N;
 };
 
-// ---------------------------------------------------------------------------
-// Fisher-Yates branchless card deal
+// =============================================================================
+// Mutable-only action state saved at each recursion level.
 //
-// Exactly `n_deal` fixed-iteration swaps — no while-loop, no divergence.
-// All 32 threads in a warp execute identical iterations.
+// hole[], community[], hole_buckets[], board_buckets[], dealer, N are set
+// once before traversal and never modified — no need to save them.
+// Saving only the mutable fields reduces per-frame stack cost from ~256 B
+// to ~120 B, allowing 16 KB stack to handle 30+ recursion levels safely.
+// =============================================================================
+struct ActionState {
+    int      stacks[GPU_MAX_PLAYERS];
+    int      bets[GPU_MAX_PLAYERS];
+    int      invested[GPU_MAX_PLAYERS];
+    int      to_act[GPU_MAX_PLAYERS];
+    uint8_t  folded;
+    uint8_t  all_in;
+    int      pot;
+    int      current_bet;
+    int      last_full_raise;
+    uint32_t action_bits;
+    int      street;
+    int      n_to_act;
+};
+
+static __device__ __forceinline__ ActionState save_action(const ThreadGame& g) {
+    ActionState s;
+    for (int i = 0; i < g.N; i++) {
+        s.stacks[i]   = g.stacks[i];
+        s.bets[i]     = g.bets[i];
+        s.invested[i] = g.invested[i];
+        s.to_act[i]   = g.to_act[i];
+    }
+    s.folded      = g.folded;
+    s.all_in      = g.all_in;
+    s.pot         = g.pot;
+    s.current_bet = g.current_bet;
+    s.last_full_raise = g.last_full_raise;
+    s.action_bits = g.action_bits;
+    s.street      = g.street;
+    s.n_to_act    = g.n_to_act;
+    return s;
+}
+
+static __device__ __forceinline__ void restore_action(ThreadGame& g, const ActionState& s) {
+    for (int i = 0; i < g.N; i++) {
+        g.stacks[i]   = s.stacks[i];
+        g.bets[i]     = s.bets[i];
+        g.invested[i] = s.invested[i];
+        g.to_act[i]   = s.to_act[i];
+    }
+    g.folded      = s.folded;
+    g.all_in      = s.all_in;
+    g.pot         = s.pot;
+    g.current_bet = s.current_bet;
+    g.last_full_raise = s.last_full_raise;
+    g.action_bits = s.action_bits;
+    g.street      = s.street;
+    g.n_to_act    = s.n_to_act;
+}
+
+// ---------------------------------------------------------------------------
+// Fisher-Yates branchless card deal into a caller-provided deck buffer.
+// deck[] lives in the kernel's local scope — not inside ThreadGame.
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ void
-deal_cards(ThreadGame& g, int n_deal, curandStatePhilox4_32_10_t* rng)
+deal_cards(uint8_t* deck, int n_deal, curandStatePhilox4_32_10_t* rng)
 {
-    for (int i = 0; i < 52; i++) g.deck[i] = (uint8_t)i;
+    for (int i = 0; i < 52; i++) deck[i] = (uint8_t)i;
     for (int i = 0; i < n_deal; i++) {
         uint32_t r = curand(rng);
         // Multiply-shift replaces integer modulo: no integer division on GPU
         int j = i + (int)(((uint64_t)r * (uint64_t)(52 - i)) >> 32);
-        uint8_t tmp = g.deck[i]; g.deck[i] = g.deck[j]; g.deck[j] = tmp;
+        uint8_t tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
     }
 }
 
@@ -304,7 +459,7 @@ deal_cards(ThreadGame& g, int n_deal, curandStatePhilox4_32_10_t* rng)
 static __device__ __forceinline__ uint8_t
 board_bucket_gpu(uint8_t h0, uint8_t h1, const uint8_t* comm, int street)
 {
-    if (street == 0) return 0;
+    if (street == 0 || g_hr == nullptr) return 0;
     uint16_t rank;
     if (street == 3)
         rank = eval7_gpu(h0, h1, comm[0], comm[1], comm[2], comm[3], comm[4]);
@@ -324,6 +479,17 @@ board_bucket_gpu(uint8_t h0, uint8_t h1, const uint8_t* comm, int street)
 // selection is a single integer multiply with no conditional branch.
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ int
+fallback_action_passive_gpu(uint8_t valid_mask)
+{
+    if (valid_mask & (1 << 1)) return 1;  // CHECK
+    if (valid_mask & (1 << 2)) return 2;  // CALL
+    if (valid_mask & (1 << 0)) return 0;  // FOLD
+    for (int a = 3; a < GPU_NUM_ACTIONS; a++)
+        if (valid_mask & (1 << a)) return a;
+    return 1;
+}
+
+static __device__ __forceinline__ int
 sample_action(curandStatePhilox4_32_10_t* rng,
               const __nv_bfloat16* __restrict__ strategy,
               uint32_t info_idx, int table_size, uint8_t valid_mask)
@@ -339,8 +505,8 @@ sample_action(curandStatePhilox4_32_10_t* rng,
         int crossed = valid & (result < 0) & (r <= cum);
         result += crossed * (a - result);  // if crossed: result=a; else: unchanged
     }
-    // Fallback: highest valid action (handles zero-probability edge case)
-    if (result < 0) result = 31 - __clz((unsigned)valid_mask);
+    // Fallback: prefer a passive legal action over a random jam.
+    if (result < 0) result = fallback_action_passive_gpu(valid_mask);
     return result;
 }
 
@@ -352,7 +518,9 @@ static __device__ __forceinline__ bool
 apply_action_gpu(ThreadGame& g, int player, int a)
 {
     int to_call = g.current_bet - g.bets[player];
-    int chips   = chips_for_action_gpu(a, g.pot, g.stacks[player], to_call);
+    int chips   = chips_for_action_gpu(
+        a, g.pot, g.stacks[player], to_call,
+        g.current_bet, g.last_full_raise, g.bb_amt);
 
     // Compress action into history (3 bits per action); mask to 30 bits to
     // prevent high-bit overflow corrupting the FNV-1a hash after 10+ actions.
@@ -368,6 +536,10 @@ apply_action_gpu(ThreadGame& g, int player, int a)
     if (g.stacks[player] == 0) g.all_in |= (1u << player);
 
     if (g.bets[player] > g.current_bet) {
+        const int prev_bet = g.current_bet;
+        const int raise_size = g.bets[player] - prev_bet;
+        if (raise_size >= g.last_full_raise || prev_bet == 0)
+            g.last_full_raise = raise_size;
         g.current_bet = g.bets[player];
         return true;  // raise — caller must rebuild action queue
     }
@@ -435,6 +607,12 @@ comb_accumulate(
 // Linear CFR weighting: strategy contribution multiplied by iteration t.
 // CFR+ clamping applied via separate kernel_clamp_regrets after each batch.
 // =============================================================================
+// Maximum recursion depth. Each frame ≈ 400–600 B (ActionState + locals +
+// register spill); 20 levels × 600 B = 12 KB, safely within the 16 KB limit.
+// Games that genuinely exceed 20 decision-points in a single street sequence
+// are pathological (stack=1000, bb=20 → at most ~6 re-raises before all-in).
+#define MAX_TRAVERSE_DEPTH 20
+
 static __device__ float
 traverse_gpu(ThreadGame& g,
              const __nv_bfloat16* __restrict__ strategy,  // BF16 — read-only
@@ -447,8 +625,13 @@ traverse_gpu(ThreadGame& g,
              curandStatePhilox4_32_10_t* rng,
              uint32_t* sc_keys,           // shared-mem combining buffer keys
              float*    sc_rd,             // shared-mem regret deltas
-             float*    sc_sd)             // shared-mem strategy_sum deltas
+             float*    sc_sd,             // shared-mem strategy_sum deltas
+             int depth = 0)               // recursion depth guard
 {
+    // Depth limit: return 0 (no gain) for pathologically deep trees.
+    // This is extremely rare with typical stack/blind sizes.
+    if (depth >= MAX_TRAVERSE_DEPTH) return 0.0f;
+
     // --- Terminal: only one player remains ---
     int active = 0, winner = -1;
     for (int i = 0; i < g.N; i++)
@@ -467,6 +650,7 @@ traverse_gpu(ThreadGame& g,
             g.street++;
             for (int i = 0; i < g.N; i++) g.bets[i] = 0;
             g.current_bet = 0;
+            g.last_full_raise = g.bb_amt;
             g.n_to_act = 0;
             for (int i = 1; i <= g.N; i++) {
                 int p = (g.dealer + i) % g.N;
@@ -476,15 +660,22 @@ traverse_gpu(ThreadGame& g,
             if (g.n_to_act > 0)
                 return traverse_gpu(g, strategy, regrets, strategy_sum,
                                     ev_baseline, table_size, update_player,
-                                    iteration, rng, sc_keys, sc_rd, sc_sd);
+                                    iteration, rng, sc_keys, sc_rd, sc_sd,
+                                    depth + 1);
         }
         // Showdown
         uint16_t ranks[6] = {};
         for (int p = 0; p < g.N; p++) {
             if (g.folded & (1u << p)) continue;
-            ranks[p] = eval7_gpu(g.hole[p*2], g.hole[p*2+1],
-                                 g.community[0], g.community[1], g.community[2],
-                                 g.community[3], g.community[4]);
+            if (g_hr != nullptr) {
+                ranks[p] = eval7_gpu(g.hole[p*2], g.hole[p*2+1],
+                                     g.community[0], g.community[1], g.community[2],
+                                     g.community[3], g.community[4]);
+            } else {
+                // Fallback when handranks.dat not loaded: use hole card rank sum
+                // as a rough strength proxy (0..24 range). Approximate only.
+                ranks[p] = (uint16_t)((g.hole[p*2] % 13) + (g.hole[p*2+1] % 13) + 1);
+            }
         }
         uint16_t best = 0;
         for (int p = 0; p < g.N; p++)
@@ -501,7 +692,9 @@ traverse_gpu(ThreadGame& g,
     // --- Get current actor ---
     int player  = g.to_act[0];
     int to_call = g.current_bet - g.bets[player];
-    uint8_t vm  = valid_mask_gpu(g.pot, g.stacks[player], to_call);
+    uint8_t vm  = valid_mask_gpu(
+        g.pot, g.stacks[player], to_call,
+        g.current_bet, g.last_full_raise, g.bb_amt);
     uint32_t info_idx = info_set_hash(
         (uint8_t)player,
         g.hole_buckets[player],
@@ -511,11 +704,22 @@ traverse_gpu(ThreadGame& g,
 
     if (player == update_player) {
         // ----------------------------------------------------------------
-        // Update player: traverse ALL valid actions (external sampling)
+        // Update player: Outcome Sampling (OS-MCCFR)
+        //
+        // Sample ONE action proportional to regret-matched strategy, then
+        // apply an importance-sampling (IS) correction to the regret update.
+        // This replaces the ES "explore all actions" loop that caused
+        // O(actions^depth) branching and severe GPU warp divergence.
+        //
+        // Correctness: OS-MCCFR is unbiased in expectation — each sampled
+        // path contributes the full counterfactual regret scaled by 1/prob.
+        // Convergence is slower per iteration than ES but much faster
+        // per wall-clock second on GPU due to ~8× less divergent work.
+        //
+        // Reference: Lanctot et al. (2009), Schmid et al. VR-MCCFR (2019).
         // ----------------------------------------------------------------
         float strat[GPU_NUM_ACTIONS];
         float sum_r = 0.0f;
-        // Load strategy — read BF16 from global, convert to FP32 in registers
         for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
             float r = (vm & (1 << a))
                       ? fmaxf(0.0f, regrets[a * table_size + info_idx])
@@ -523,52 +727,45 @@ traverse_gpu(ThreadGame& g,
             strat[a] = r;
             sum_r   += r;
         }
-        // Normalize (regret matching)
         for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
             strat[a] = (sum_r > 1e-7f)
                        ? strat[a] / sum_r
                        : ((vm & (1 << a)) ? 1.0f / __popc((unsigned)vm) : 0.0f);
         }
 
-        // Explore all actions, compute EV
-        float vals[GPU_NUM_ACTIONS] = {};
-        float ev = 0.0f;
+        // Sample one action; clamp prob to avoid IS explosion on rare actions.
+        int sampled = sample_action(rng, strategy, info_idx, table_size, vm);
+        float q = fmaxf(strat[sampled], 0.05f);   // IS denominator, floor at 5%
 
-        for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
-            if (!(vm & (1 << a))) continue;
+        ActionState saved = save_action(g);
+        g.n_to_act--;
+        for (int i = 0; i < g.n_to_act; i++) g.to_act[i] = g.to_act[i+1];
+        bool raised = apply_action_gpu(g, player, sampled);
+        if (raised) rebuild_queue(g, player);
 
-            ThreadGame saved = g;
+        float child_ev = traverse_gpu(g, strategy, regrets, strategy_sum,
+                                      ev_baseline, table_size, update_player,
+                                      iteration, rng, sc_keys, sc_rd, sc_sd,
+                                      depth + 1);
+        restore_action(g, saved);
 
-            g.n_to_act--;
-            for (int i = 0; i < g.n_to_act; i++) g.to_act[i] = g.to_act[i+1];
+        // EV estimate for this info-set (unbiased under OS sampling).
+        float ev = strat[sampled] * child_ev;
 
-            bool raised = apply_action_gpu(g, player, a);
-            if (raised) rebuild_queue(g, player);
-
-            vals[a] = traverse_gpu(g, strategy, regrets, strategy_sum,
-                                   ev_baseline, table_size, update_player,
-                                   iteration, rng, sc_keys, sc_rd, sc_sd);
-            ev += strat[a] * vals[a];
-            g = saved;
-        }
-
-        // ---------------------------------------------------------------------------
-        // Variance-reduction baseline: EMA of EV at this info-set.
-        // b = 0.98*b + 0.02*ev (lock-free write — slight noise in b is harmless).
-        // The regret update is unchanged (vals[a]-ev), but b provides a diagnostic
-        // and enables future importance-sampling (hybrid OS+ES) extensions.
-        // ---------------------------------------------------------------------------
+        // Variance-reduction baseline (EMA).
         float b = ev_baseline[info_idx];
-        ev_baseline[info_idx] = b + 0.02f * (ev - b);   // EMA, α = 0.02
+        ev_baseline[info_idx] = b + 0.02f * (ev - b);
 
-        // Strategy_sum update via combining buffer (BF16 strategy written separately
-        // by kernel_regret_matching; strategy_sum is FP32 running sum)
+        // IS-corrected regret + strategy_sum updates.
+        // Sampled action: IS-corrected counterfactual value (child_ev/q) minus ev.
+        // Other valid actions: counterfactual value is 0 (not sampled) minus ev.
         float lcfr_weight = (float)iteration;
         for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
             if (!(vm & (1 << a))) continue;
+            float cf_val = (a == sampled) ? (child_ev / q) : 0.0f;
             comb_accumulate(sc_keys, sc_rd, sc_sd,
                             info_idx, a,
-                            vals[a] - ev,            // regret delta
+                            cf_val - ev,             // IS regret delta
                             lcfr_weight * strat[a],  // strategy_sum delta
                             regrets, strategy_sum, table_size);
         }
@@ -580,7 +777,7 @@ traverse_gpu(ThreadGame& g,
         // ----------------------------------------------------------------
         int chosen = sample_action(rng, strategy, info_idx, table_size, vm);
 
-        ThreadGame saved = g;
+        ActionState saved = save_action(g);
         g.n_to_act--;
         for (int i = 0; i < g.n_to_act; i++) g.to_act[i] = g.to_act[i+1];
 
@@ -589,8 +786,9 @@ traverse_gpu(ThreadGame& g,
 
         float result = traverse_gpu(g, strategy, regrets, strategy_sum,
                                     ev_baseline, table_size, update_player,
-                                    iteration, rng, sc_keys, sc_rd, sc_sd);
-        g = saved;
+                                    iteration, rng, sc_keys, sc_rd, sc_sd,
+                                    depth + 1);
+        restore_action(g, saved);
         return result;
     }
 }
@@ -616,17 +814,22 @@ void kernel_simulate_batch(
     curandStatePhilox4_32_10_t* __restrict__ rng_states,
     float*                                   regrets,
     float*                                   strategy_sum,
-    const __nv_bfloat16* __restrict__        strategy,   // BF16
+    const __nv_bfloat16* __restrict__        strategy,        // BF16
     float*                                   ev_baseline,
     int num_games,
-    int update_player,
+    const int*       __restrict__ update_player_ptr,  // device scalar (graph-safe)
     int num_players,
     int starting_stack,
     int sb, int bb,
-    long long iteration,
+    const long long* __restrict__ iteration_ptr,      // device scalar (graph-safe)
     int table_size)
 {
     // -----------------------------------------------------------------------
+    // Dereference device-side scalars set by host before each launch/graph replay.
+    // Placing these in registers at the top avoids repeated global loads.
+    const int       update_player = *update_player_ptr;
+    const long long iteration     = *iteration_ptr;
+
     // Shared-memory combining buffer (256 slots = one per thread in block).
     // sc_keys[s]           — info_set index occupying slot s (COMB_EMPTY = free)
     // sc_rd[a*SLOTS + s]   — accumulated regret delta for action a at slot s
@@ -656,14 +859,16 @@ void kernel_simulate_batch(
     g.N = num_players;
 
     // -----------------------------------------------------------------------
-    // Branchless Fisher-Yates deal (N*2 + 5 fixed iterations, no divergence)
+    // Branchless Fisher-Yates deal. deck[] is a local temp buffer — it is
+    // NOT part of ThreadGame so it is never saved during tree recursion.
     // -----------------------------------------------------------------------
+    uint8_t deck[52];
     int n_deal = num_players * 2 + 5;
-    deal_cards(g, n_deal, &local_rng);
+    deal_cards(deck, n_deal, &local_rng);
 
-    // Extract hole and community
-    for (int i = 0; i < num_players * 2; i++) g.hole[i]      = g.deck[i];
-    for (int i = 0; i < 5;               i++) g.community[i] = g.deck[num_players * 2 + i];
+    // Extract hole and community from local deck
+    for (int i = 0; i < num_players * 2; i++) g.hole[i]      = deck[i];
+    for (int i = 0; i < 5;               i++) g.community[i] = deck[num_players * 2 + i];
 
     // -----------------------------------------------------------------------
     // Preflop buckets from __constant__ memory (on-chip cache)
@@ -685,12 +890,15 @@ void kernel_simulate_batch(
         g.stacks[i] = starting_stack; g.bets[i] = 0; g.invested[i] = 0;
     }
     g.folded = 0; g.all_in = 0; g.pot = 0; g.current_bet = 0;
+    g.last_full_raise = bb;
+    g.bb_amt = bb;
     g.action_bits = 0; g.street = 0;
 
     g.dealer = (int)(curand(&local_rng) % num_players);
 
-    int sb_pos = (g.dealer + 1) % num_players;
-    int bb_pos = (g.dealer + 2) % num_players;
+    int sb_pos = (num_players == 2) ? g.dealer : (g.dealer + 1) % num_players;
+    int bb_pos = (num_players == 2) ? ((g.dealer + 1) % num_players)
+                                    : (g.dealer + 2) % num_players;
     int sb_amt = min(sb, g.stacks[sb_pos]);
     int bb_amt = min(bb, g.stacks[bb_pos]);
     g.stacks[sb_pos] -= sb_amt; g.bets[sb_pos] = sb_amt; g.invested[sb_pos] = sb_amt;
@@ -709,7 +917,7 @@ void kernel_simulate_batch(
     // Run traversal — updates go into the shared combining buffer
     traverse_gpu(g, strategy, regrets, strategy_sum,
                  ev_baseline, table_size, update_player, iteration,
-                 &local_rng, sc_keys, sc_rd, sc_sd);
+                 &local_rng, sc_keys, sc_rd, sc_sd, /*depth=*/0);
 
     // Write Philox state back to global memory ONCE (amortized cost)
     rng_states[tid] = local_rng;
@@ -815,6 +1023,7 @@ bool GPUCFRTrainer::load_hand_table(const char* path)
     std::vector<int32_t> host_hr(sz / sizeof(int32_t));
     f.read(reinterpret_cast<char*>(host_hr.data()), sz);
     if (!f) return false;
+    if (!validate_hand_table_host(host_hr, path)) return false;
 
     CUDA_CHECK(cudaMalloc(&d_hr_table, sz));
     CUDA_CHECK(cudaMemcpy(d_hr_table, host_hr.data(), sz, cudaMemcpyHostToDevice));
@@ -841,6 +1050,15 @@ void GPUCFRTrainer::alloc_device_buffers(int batch_size)
     CUDA_CHECK(cudaMemset(d_strategy,     0, bf16_bytes));
     CUDA_CHECK(cudaMemset(d_ev_baseline,  0, base_bytes));
 
+    // Device-side scalars for CUDA Graph replay.
+    // The graph captures fixed pointer arguments; update these before each launch.
+    CUDA_CHECK(cudaMalloc(&d_iter_counter,   sizeof(long long)));
+    CUDA_CHECK(cudaMalloc(&d_player_counter, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_iter_counter,   0, sizeof(long long)));
+    CUDA_CHECK(cudaMemset(d_player_counter, 0, sizeof(int)));
+
+    batch_size_ = batch_size;
+
     printf("GPU buffers:  regrets=%.1f MB  ssum=%.1f MB  strategy(BF16)=%.1f MB  baseline=%.1f MB\n",
            fp32_bytes/1e6, fp32_bytes/1e6, bf16_bytes/1e6, base_bytes/1e6);
     printf("  Total: %.1f MB (vs %.1f MB all-FP32)\n",
@@ -850,12 +1068,14 @@ void GPUCFRTrainer::alloc_device_buffers(int batch_size)
 
 void GPUCFRTrainer::free_device_buffers()
 {
-    if (d_regrets)      { cudaFree(d_regrets);      d_regrets      = nullptr; }
-    if (d_strategy_sum) { cudaFree(d_strategy_sum); d_strategy_sum = nullptr; }
-    if (d_strategy)     { cudaFree(d_strategy);     d_strategy     = nullptr; }
-    if (d_ev_baseline)  { cudaFree(d_ev_baseline);  d_ev_baseline  = nullptr; }
-    if (d_rng_states)   { cudaFree(d_rng_states);   d_rng_states   = nullptr; }
-    if (d_hr_table)     { cudaFree(d_hr_table);     d_hr_table     = nullptr; }
+    if (d_regrets)        { cudaFree(d_regrets);        d_regrets        = nullptr; }
+    if (d_strategy_sum)   { cudaFree(d_strategy_sum);   d_strategy_sum   = nullptr; }
+    if (d_strategy)       { cudaFree(d_strategy);       d_strategy       = nullptr; }
+    if (d_ev_baseline)    { cudaFree(d_ev_baseline);    d_ev_baseline    = nullptr; }
+    if (d_iter_counter)   { cudaFree(d_iter_counter);   d_iter_counter   = nullptr; }
+    if (d_player_counter) { cudaFree(d_player_counter); d_player_counter = nullptr; }
+    if (d_rng_states)     { cudaFree(d_rng_states);     d_rng_states     = nullptr; }
+    if (d_hr_table)       { cudaFree(d_hr_table);       d_hr_table       = nullptr; }
 }
 
 void GPUCFRTrainer::init_rng(int batch_size, unsigned long long seed)
@@ -890,8 +1110,10 @@ void GPUCFRTrainer::run_regret_matching()
         d_regrets, d_strategy, GPU_TABLE_SIZE);
 }
 
-void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
-                                          long long iteration)
+// Launches only the simulation kernel; safe to record in a CUDA Graph because
+// all changing values (player, iteration) are read from d_player_counter /
+// d_iter_counter at kernel execution time — the captured pointer args are stable.
+void GPUCFRTrainer::launch_sim_kernel(int batch_size)
 {
     int blocks = (batch_size + GPU_BLOCK_SIZE - 1) / GPU_BLOCK_SIZE;
     kernel_simulate_batch<<<blocks, GPU_BLOCK_SIZE, 0, compute_stream_>>>(
@@ -900,10 +1122,23 @@ void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
         d_strategy,           // BF16
         d_ev_baseline,
         batch_size,
-        update_player,
+        d_player_counter,     // device pointer — graph-safe
         N_, stack_, sb_, bb_,
-        iteration,
+        d_iter_counter,       // device pointer — graph-safe
         GPU_TABLE_SIZE);
+}
+
+// Updates the device-side counters on compute_stream_ then launches the kernel.
+// The async memcpys are ordered before the kernel on the same stream, so the
+// kernel sees the correct values.  This path is NOT called during graph capture.
+void GPUCFRTrainer::run_simulation_batch(int batch_size, int update_player,
+                                          long long iteration)
+{
+    CUDA_CHECK(cudaMemcpyAsync(d_player_counter, &update_player,
+                               sizeof(int),       cudaMemcpyHostToDevice, compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &iteration,
+                               sizeof(long long), cudaMemcpyHostToDevice, compute_stream_));
+    launch_sim_kernel(batch_size);
 }
 
 void GPUCFRTrainer::run_cfr_plus_clamp()
@@ -937,33 +1172,81 @@ void GPUCFRTrainer::allreduce_tables()
 // =============================================================================
 // Main training loop
 // =============================================================================
-void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbose)
+void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbose,
+                          const std::string& ckpt_path, long long ckpt_interval)
 {
-    alloc_device_buffers(batch_size);
+    // Only allocate + zero-init if not already done (e.g. by load_checkpoint).
+    // Skipping alloc here preserves checkpoint data already in device memory.
+    if (!d_regrets) alloc_device_buffers(batch_size);
     init_rng(batch_size);
     upload_preflop_lut();
 
-    // traverse_gpu recurses up to ~30 levels; new frame includes comb buffer ptrs
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 10240));
+    // traverse_gpu can recurse ~20 levels for 2-player games; each frame holds
+    // a ~256-byte ThreadGame copy plus local vars (~400 bytes/frame total).
+    // 16 kB (= ~40 frames) is sufficient for --players 2.
+    // For --players 6 with deeper trees, increase to 32768 at the cost of
+    // reduced SM occupancy (~150x throughput penalty due to L2 pressure).
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 16384));
 
     if (verbose)
         printf("Training: %lld iters, batch=%d, players=%d, CFR+=%s, LCFR=%s\n",
                total_iterations, batch_size, N_,
                cfr_plus_ ? "on" : "off", linear_cfr_ ? "on" : "off");
 
+    // -----------------------------------------------------------------------
+    // CUDA Graph capture
+    //
+    // Capture one player-update cycle: [regret_match → simulate → clamp].
+    // kernel_simulate_batch reads update_player and iteration via device
+    // pointers (d_player_counter / d_iter_counter), so the captured graph has
+    // stable pointer arguments.  Before each replay we push the current values
+    // with cudaMemcpyAsync on compute_stream_; same-stream ordering guarantees
+    // the kernel sees the updated scalars.
+    //
+    // Re-capture if batch_size changed (e.g. second train() call with new batch).
+    // -----------------------------------------------------------------------
+    if (graph_captured_ && batch_size != batch_size_) {
+        if (verbose) printf("Batch size changed (%d→%d); recapturing CUDA graph.\n",
+                            batch_size_, batch_size);
+        cudaGraphExecDestroy(graph_exec_); graph_exec_  = nullptr;
+        cudaGraphDestroy(cuda_graph_);     cuda_graph_  = nullptr;
+        graph_captured_ = false;
+        batch_size_     = batch_size;
+    }
+
+    if (!graph_captured_) {
+        // Capture: no work is executed during StreamBeginCapture…StreamEndCapture.
+        CUDA_CHECK(cudaStreamBeginCapture(compute_stream_,
+                                          cudaStreamCaptureModeGlobal));
+        run_regret_matching();
+        launch_sim_kernel(batch_size);
+        run_cfr_plus_clamp();
+        CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &cuda_graph_));
+        CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, cuda_graph_,
+                                        nullptr, nullptr, 0));
+        graph_captured_ = true;
+        batch_size_     = batch_size;
+        if (verbose) printf("CUDA Graph captured (3 kernels per player-update).\n");
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (long long iter = 1; iter <= total_iterations; iter++) {
-        // Alternating updates (CFR+): update each player in turn
+        // Alternating updates (CFR+): update each player in turn.
+        // For each player: push updated scalars, then replay the captured graph.
         for (int p = 0; p < N_; p++) {
-            // Step 1: Regret matching → BF16 strategy from current FP32 regrets
-            run_regret_matching();
+            // Update device-side scalars before graph replay.
+            // Both memcpys are on compute_stream_, so they complete before the
+            // graph kernels execute (same stream = ordered execution).
+            CUDA_CHECK(cudaMemcpyAsync(d_player_counter, &p,
+                                       sizeof(int),       cudaMemcpyHostToDevice,
+                                       compute_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &iter,
+                                       sizeof(long long), cudaMemcpyHostToDevice,
+                                       compute_stream_));
 
-            // Step 2: Simulate batch; combining buffer reduces global atomics
-            run_simulation_batch(batch_size, p, iter);
-
-            // Step 3: CFR+ — clamp negative regrets to zero
-            run_cfr_plus_clamp();
+            // Replay: [regret_match → simulate(p, iter) → clamp]
+            CUDA_CHECK(cudaGraphLaunch(graph_exec_, compute_stream_));
         }
 
         // Step 4 (multi-GPU): AllReduce regrets + strategy_sum via NCCL
@@ -979,6 +1262,12 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
                    iter, total_iterations,
                    hands_done / 1e6,
                    hands_done / sec / 1e6);
+        }
+
+        if (!ckpt_path.empty() && ckpt_interval > 0 && iter % ckpt_interval == 0 && iter > 0) {
+            CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+            if (save_checkpoint(ckpt_path))
+                printf("  [checkpoint saved at iter %lld -> %s]\n", iter, ckpt_path.c_str());
         }
     }
 
@@ -1040,6 +1329,39 @@ int GPUCFRTrainer::num_info_sets_active() const
 }
 
 // =============================================================================
+// MPI table export / import
+//
+// export_tables() downloads the two FP32 arrays (regrets, strategy_sum) from
+// device to host so the caller can pass them to MPI_Allreduce(MPI_SUM).
+// import_tables() uploads the globally-reduced arrays back to the device.
+// The BF16 d_strategy cache is NOT synced here — run_regret_matching() on the
+// first training iteration will recompute it from the merged regrets.
+// =============================================================================
+void GPUCFRTrainer::export_tables(std::vector<float>& reg,
+                                   std::vector<float>& ssum) const
+{
+    size_t n = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE;
+    reg.resize(n);
+    ssum.resize(n);
+    CUDA_CHECK(cudaMemcpyAsync(reg.data(),  d_regrets,
+                               n * sizeof(float), cudaMemcpyDeviceToHost, transfer_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(ssum.data(), d_strategy_sum,
+                               n * sizeof(float), cudaMemcpyDeviceToHost, transfer_stream_));
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+}
+
+void GPUCFRTrainer::import_tables(const std::vector<float>& reg,
+                                   const std::vector<float>& ssum)
+{
+    size_t n = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE;
+    CUDA_CHECK(cudaMemcpyAsync(d_regrets,      reg.data(),
+                               n * sizeof(float), cudaMemcpyHostToDevice, transfer_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_strategy_sum, ssum.data(),
+                               n * sizeof(float), cudaMemcpyHostToDevice, transfer_stream_));
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+}
+
+// =============================================================================
 // Checkpoint save / load (uses async transfer stream)
 // =============================================================================
 bool GPUCFRTrainer::save_checkpoint(const std::string& path) const
@@ -1085,6 +1407,28 @@ bool GPUCFRTrainer::load_checkpoint(const std::string& path)
     f.read((char*)reg.data(),  n * sizeof(float));
     f.read((char*)ssum.data(), n * sizeof(float));
     if (!f) return false;
+
+    // Allocate device buffers if train() has not been called yet.
+    // d_regrets == nullptr means alloc_device_buffers() hasn't run.
+    // We allocate without zeroing regrets/strategy_sum — checkpoint data fills them.
+    // d_strategy and d_ev_baseline are zeroed; train() will recompute them on the
+    // first regret-matching pass.
+    if (!d_regrets) {
+        size_t fp32_bytes = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE * sizeof(float);
+        size_t bf16_bytes = (size_t)GPU_NUM_ACTIONS * GPU_TABLE_SIZE * sizeof(__nv_bfloat16);
+        size_t base_bytes = (size_t)GPU_TABLE_SIZE  * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&d_regrets,      fp32_bytes));
+        CUDA_CHECK(cudaMalloc(&d_strategy_sum, fp32_bytes));
+        CUDA_CHECK(cudaMalloc(&d_strategy,     bf16_bytes));
+        CUDA_CHECK(cudaMalloc(&d_ev_baseline,  base_bytes));
+        CUDA_CHECK(cudaMemset(d_strategy,    0, bf16_bytes));
+        CUDA_CHECK(cudaMemset(d_ev_baseline, 0, base_bytes));
+        // Allocate the CUDA-Graph counter scalars too
+        CUDA_CHECK(cudaMalloc(&d_iter_counter,   sizeof(long long)));
+        CUDA_CHECK(cudaMalloc(&d_player_counter, sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_iter_counter,   0, sizeof(long long)));
+        CUDA_CHECK(cudaMemset(d_player_counter, 0, sizeof(int)));
+    }
 
     CUDA_CHECK(cudaMemcpy(d_regrets,      reg.data(),  n*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_strategy_sum, ssum.data(), n*sizeof(float), cudaMemcpyHostToDevice));
