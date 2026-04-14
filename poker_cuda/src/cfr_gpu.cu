@@ -77,6 +77,18 @@
 // ---------------------------------------------------------------------------
 __device__ static int32_t* g_hr = nullptr;  // set from host via cudaMemcpyToSymbol
 
+// ---------------------------------------------------------------------------
+// Card encoding conversion: project uses suit-major (card = suit*13 + rank,
+// 0-based), but the Two Plus Two table indexes cards in rank-major
+// (card = rank*4 + suit, 1-based). Identical to hand_eval.cpp's to_rm().
+// Without this conversion every suit other than clubs gets the wrong card
+// identity: e.g. suit-major 2d (idx=13) would hit the 5d slot instead.
+// ---------------------------------------------------------------------------
+static __device__ __forceinline__ int sm_to_rm(uint8_t c)
+{
+    return (int)(c % 13) * 4 + (int)(c / 13) + 1;
+}
+
 static __device__ __forceinline__ uint16_t
 decode_packed_rank_gpu(uint16_t packed)
 {
@@ -100,11 +112,11 @@ decode_packed_rank_gpu(uint16_t packed)
 static __device__ __forceinline__ uint16_t
 eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
 {
-    int p = __ldg(&g_hr[53 + c0 + 1]);
-    p     = __ldg(&g_hr[p  + c1 + 1]);
-    p     = __ldg(&g_hr[p  + c2 + 1]);
-    p     = __ldg(&g_hr[p  + c3 + 1]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c4 + 1]));
+    int p = __ldg(&g_hr[53 + sm_to_rm(c0)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c4)]));
 }
 
 // Two Plus Two supports sequential 7-card lookup in exactly 7 steps — no
@@ -113,13 +125,13 @@ static __device__ __forceinline__ uint16_t
 eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
           uint8_t c3, uint8_t c4, uint8_t c5, uint8_t c6)
 {
-    int p = __ldg(&g_hr[53 + c0 + 1]);
-    p     = __ldg(&g_hr[p  + c1 + 1]);
-    p     = __ldg(&g_hr[p  + c2 + 1]);
-    p     = __ldg(&g_hr[p  + c3 + 1]);
-    p     = __ldg(&g_hr[p  + c4 + 1]);
-    p     = __ldg(&g_hr[p  + c5 + 1]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c6 + 1]));
+    int p = __ldg(&g_hr[53 + sm_to_rm(c0)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c5)]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c6)]));
 }
 
 // 6-card sequential lookup for turn evaluation (2 hole + 4 community).
@@ -127,12 +139,12 @@ static __device__ __forceinline__ uint16_t
 eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
           uint8_t c3, uint8_t c4, uint8_t c5)
 {
-    int p = __ldg(&g_hr[53 + c0 + 1]);
-    p     = __ldg(&g_hr[p  + c1 + 1]);
-    p     = __ldg(&g_hr[p  + c2 + 1]);
-    p     = __ldg(&g_hr[p  + c3 + 1]);
-    p     = __ldg(&g_hr[p  + c4 + 1]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + c5 + 1]));
+    int p = __ldg(&g_hr[53 + sm_to_rm(c0)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
+    p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
+    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c5)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,7 +1253,10 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
             CUDA_CHECK(cudaMemcpyAsync(d_player_counter, &p,
                                        sizeof(int),       cudaMemcpyHostToDevice,
                                        compute_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &iter,
+            // Linear CFR weights strategy_sum by iteration t.
+            // Vanilla CFR (--no-lcfr) uses uniform weight 1 instead.
+            long long lcfr_val = linear_cfr_ ? iter : 1LL;
+            CUDA_CHECK(cudaMemcpyAsync(d_iter_counter,   &lcfr_val,
                                        sizeof(long long), cudaMemcpyHostToDevice,
                                        compute_stream_));
 
