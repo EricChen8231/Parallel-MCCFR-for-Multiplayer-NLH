@@ -1,6 +1,7 @@
 #include "strategy.h"
 #include <fstream>
 #include <cstdio>
+#include <cmath>
 
 // Binary format:
 //   [uint64_t magic] [uint32_t num_entries]
@@ -15,6 +16,19 @@ static bool peek_magic(const std::string& path, uint64_t& magic)
     if (!f) return false;
     f.read((char*)&magic, sizeof(magic));
     return (bool)f;
+}
+
+static bool is_uniform_placeholder(const StrategyEntry& e)
+{
+    // Older exports normalized never-visited rows to exactly uniform 1/8
+    // probabilities.  Treat those as absent so passive unseen-state fallback
+    // remains effective when loading old strategy files.
+    constexpr float uniform = 1.0f / GPU_NUM_ACTIONS;
+    for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
+        if (std::fabs(e.probs[a] - uniform) > 1e-6f)
+            return false;
+    }
+    return true;
 }
 
 bool strategy_save(const HostStrategyTable& strat, const std::string& path)
@@ -54,12 +68,22 @@ bool strategy_load(HostStrategyTable& strat, const std::string& path)
         return false;
     }
     strat.reserve(n);
+    uint32_t skipped_placeholders = 0;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t k;
         StrategyEntry e;
         f.read((char*)&k,      sizeof(k));
         f.read((char*)e.probs, GPU_NUM_ACTIONS * sizeof(float));
+        if (is_uniform_placeholder(e)) {
+            skipped_placeholders++;
+            continue;
+        }
         strat.emplace(k, e);
+    }
+    if (skipped_placeholders > 0) {
+        fprintf(stderr,
+                "NOTE: ignored %u uniform placeholder rows from older strategy export.\n",
+                skipped_placeholders);
     }
     return (bool)f;
 }

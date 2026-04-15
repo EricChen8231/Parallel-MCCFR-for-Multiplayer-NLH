@@ -794,7 +794,7 @@ static HumanDecision human_input_action(uint8_t vm, int pot, int stack,
     const bool can_raise = (vm & ((1 << 3) | (1 << 4) | (1 << 5) | (1 << 6))) != 0;
     const int min_raise_to = min_raise_to_total(current_bet, last_full_raise, bb_amt);
     const int max_raise_to = current_bet + (stack - to_call);
-    const int min_chips = can_raise
+    const int quarter_chips = can_raise
         ? legal_raise_chips_for_action(3, pot, stack, to_call, current_bet, last_full_raise, bb_amt)
         : 0;
     const int half_chips = can_raise
@@ -811,13 +811,17 @@ static HumanDecision human_input_action(uint8_t vm, int pot, int stack,
     if (vm & (1 << 1)) printf("    [k] Check\n");
     if (vm & (1 << 2)) printf("    [c] Call %d\n", std::min(to_call, stack));
     if (can_raise) {
-        printf("    [3] Min raise to %d  (put in %d)\n",
-               raise_to_from_chips(min_chips, to_call, current_bet), min_chips);
-        if (half_chips != min_chips && half_chips < stack) {
+        const int quarter_to = raise_to_from_chips(quarter_chips, to_call, current_bet);
+        if (quarter_to == min_raise_to) {
+            printf("    [3] Min raise to %d  (put in %d)\n", quarter_to, quarter_chips);
+        } else {
+            printf("    [3] Quarter-pot raise to %d  (put in %d)\n", quarter_to, quarter_chips);
+        }
+        if (half_chips != quarter_chips && half_chips < stack) {
             printf("    [4] Half-pot raise to %d  (put in %d)\n",
                    raise_to_from_chips(half_chips, to_call, current_bet), half_chips);
         }
-        if (pot_chips != half_chips && pot_chips != min_chips && pot_chips < stack) {
+        if (pot_chips != half_chips && pot_chips != quarter_chips && pot_chips < stack) {
             printf("    [6] Pot raise to %d  (put in %d)\n",
                    raise_to_from_chips(pot_chips, to_call, current_bet), pot_chips);
         }
@@ -844,11 +848,11 @@ static HumanDecision human_input_action(uint8_t vm, int pot, int stack,
         if ((ch == 'a' || ch == 'A') && (vm & (1 << 7))) return { 7, stack };
 
         if (can_raise && ch == '3')
-            return { 3, min_chips };
-        if (can_raise && ch == '4' && half_chips != min_chips && half_chips < stack)
+            return { 3, quarter_chips };
+        if (can_raise && ch == '4' && half_chips != quarter_chips && half_chips < stack)
             return { 4, half_chips };
         if (can_raise && ch == '6' && pot_chips != half_chips &&
-            pot_chips != min_chips && pot_chips < stack)
+            pot_chips != quarter_chips && pot_chips < stack)
             return { 6, pot_chips };
 
         const char* num_start = buf;
@@ -879,9 +883,9 @@ static HumanDecision human_input_action(uint8_t vm, int pot, int stack,
         if (vm & 2)   printf("k ");
         if (vm & 4)   printf("c ");
         if (can_raise) printf("3 ");
-        if (can_raise && half_chips != min_chips && half_chips < stack) printf("4 ");
+        if (can_raise && half_chips != quarter_chips && half_chips < stack) printf("4 ");
         if (can_raise && pot_chips != half_chips &&
-            pot_chips != min_chips && pot_chips < stack) printf("6 ");
+            pot_chips != quarter_chips && pot_chips < stack) printf("6 ");
         if (can_raise) printf("r <total> ");
         if (vm & 128) printf("a ");
         printf("\n");

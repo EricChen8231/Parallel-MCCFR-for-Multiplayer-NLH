@@ -978,8 +978,11 @@ void kernel_normalize_strategy(
     for (int a = 0; a < GPU_NUM_ACTIONS; a++) total += smem[local_is][a];
     float my_s = smem[local_is][action];
 
+    // Leave never-visited rows as all zeros.  The host exporter skips zero rows,
+    // which lets eval/human mode use the passive unseen-state fallback instead
+    // of treating unvisited info sets as a real uniform strategy.
     final_strategy[action * table_size + info_set] =
-        (total > 1e-7f) ? (my_s / total) : (1.0f / GPU_NUM_ACTIONS);
+        (total > 1e-7f) ? (my_s / total) : 0.0f;
 }
 
 // =============================================================================
