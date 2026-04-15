@@ -76,8 +76,9 @@ static int fallback_action_passive(uint8_t valid_mask)
     if (valid_mask & (1 << 1)) return 1;  // CHECK
     if (valid_mask & (1 << 2)) return 2;  // CALL
     if (valid_mask & (1 << 0)) return 0;  // FOLD
-    for (int a = 3; a < GPU_NUM_ACTIONS; a++)
+    for (int a = 3; a < GPU_NUM_ACTIONS - 1; a++)
         if (valid_mask & (1 << a)) return a;
+    if (valid_mask & (1 << 7)) return 7;  // ALL_IN as last resort
     return 1;
 }
 

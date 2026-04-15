@@ -81,8 +81,9 @@ static int fallback_action_passive(uint8_t valid_mask)
     if (valid_mask & (1 << 1)) return 1;  // CHECK
     if (valid_mask & (1 << 2)) return 2;  // CALL
     if (valid_mask & (1 << 0)) return 0;  // FOLD
-    for (int a = 3; a < GPU_NUM_ACTIONS; a++)
+    for (int a = 3; a < GPU_NUM_ACTIONS - 1; a++)
         if (valid_mask & (1 << a)) return a;
+    if (valid_mask & (1 << 7)) return 7;  // ALL_IN as last resort
     return 1;
 }
 
@@ -93,10 +94,17 @@ void LiveBot::gto_probs(float* out, uint8_t player, uint8_t hole_b,
     uint32_t key = fnv_hash(player, hole_b, board_b, street, action_bits);
     auto it = strat_.find(key);
     if (it != strat_.end()) {
-        memcpy(out, it->second.probs, GPU_NUM_ACTIONS * sizeof(float));
+        float sum = 0.f;
+        for (int a = 0; a < GPU_NUM_ACTIONS; a++) {
+            out[a] = (valid_mask & (1 << a)) ? it->second.probs[a] : 0.f;
+            sum += out[a];
+        }
+        if (sum > 1e-7f)
+            for (int a = 0; a < GPU_NUM_ACTIONS; a++) out[a] /= sum;
+        else
+            out[fallback_action_passive(valid_mask)] = 1.f;
         return;
     }
-    // Info set not seen during training: prefer a passive legal action.
     std::fill(out, out + GPU_NUM_ACTIONS, 0.f);
     out[fallback_action_passive(valid_mask)] = 1.f;
 }
