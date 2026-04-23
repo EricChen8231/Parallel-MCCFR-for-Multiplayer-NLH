@@ -26,6 +26,24 @@ static inline int to_rm(Card c) {
     return rank * 4 + suit + 1;
 }
 
+static inline uint16_t decode_packed_rank(uint16_t packed) {
+    const uint16_t cat = packed >> 12;
+    const uint16_t ordinal = packed & 0x0FFFu;
+    if (ordinal == 0) return 0;
+    switch (cat) {
+        case 1: return ordinal;
+        case 2: return (uint16_t)(1277 + ordinal);
+        case 3: return (uint16_t)(4137 + ordinal);
+        case 4: return (uint16_t)(4995 + ordinal);
+        case 5: return (uint16_t)(5853 + ordinal);
+        case 6: return (uint16_t)(5863 + ordinal);
+        case 7: return (uint16_t)(7140 + ordinal);
+        case 8: return (uint16_t)(7296 + ordinal);
+        case 9: return (uint16_t)(7452 + ordinal);
+        default: return 0;
+    }
+}
+
 static uint16_t eval7_from_table(const std::vector<int32_t>& hr,
                                  Card c0, Card c1, Card c2,
                                  Card c3, Card c4, Card c5, Card c6) {
@@ -35,7 +53,7 @@ static uint16_t eval7_from_table(const std::vector<int32_t>& hr,
     p = hr[p  + to_rm(c3)];
     p = hr[p  + to_rm(c4)];
     p = hr[p  + to_rm(c5)];
-    return (uint16_t)hr[p + to_rm(c6)];
+    return decode_packed_rank((uint16_t)hr[p + to_rm(c6)]);
 }
 
 static bool validate_hand_table(const std::vector<int32_t>& hr, const char* path) {
@@ -47,8 +65,8 @@ static bool validate_hand_table(const std::vector<int32_t>& hr, const char* path
         return false;
     }
 
-    // Standard Two Plus Two table returns raw ranks 1-7462 (higher = better).
-    // Royal flush (As Ks Qs Js Ts + 2 irrelevant cards) must evaluate to 7462.
+    // tangentforks/TwoPlusTwo stores packed category/ordinal values; decode to
+    // the standard [1..7462] rank scale. Royal flush must evaluate to 7462.
     const uint16_t royal = eval7_from_table(
         hr,
         /*As*/ 51, /*Ks*/ 50, /*Qs*/ 49, /*Js*/ 48,
@@ -91,7 +109,7 @@ static inline uint16_t eval5(Card c0, Card c1, Card c2, Card c3, Card c4) {
     p = HR[p  + to_rm(c1)];
     p = HR[p  + to_rm(c2)];
     p = HR[p  + to_rm(c3)];
-    return (uint16_t)HR[p + to_rm(c4)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c4)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +123,7 @@ static inline uint16_t eval6(Card c0, Card c1, Card c2,
     p = HR[p  + to_rm(c2)];
     p = HR[p  + to_rm(c3)];
     p = HR[p  + to_rm(c4)];
-    return (uint16_t)HR[p + to_rm(c5)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c5)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +139,7 @@ uint16_t evaluate_7cards(Card c0, Card c1, Card c2,
     p = HR[p  + to_rm(c3)];
     p = HR[p  + to_rm(c4)];
     p = HR[p  + to_rm(c5)];
-    return (uint16_t)HR[p + to_rm(c6)];
+    return decode_packed_rank((uint16_t)HR[p + to_rm(c6)]);
 }
 
 // ---------------------------------------------------------------------------
