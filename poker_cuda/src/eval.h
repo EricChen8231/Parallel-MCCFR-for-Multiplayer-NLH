@@ -78,7 +78,7 @@ EvalResult evaluate_strategy_np(
 //
 // Cards displayed as: 2-9, T, J, Q, K, A  x  c d h s
 // Actions entered via stdin:
-//   f=fold  k=check  c=call  3/4/6=preset raises  r <total>=raise to total
+//   f=fold  k=check  c=call  3/4/5/6=preset raises  r <total>=raise to total
 //   a=all-in
 //
 // Requires hand_eval_init() and abstraction_init() to have been called.

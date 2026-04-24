@@ -152,7 +152,7 @@ eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
 // ---------------------------------------------------------------------------
 // Preflop bucket lookup in constant memory
 // __constant__ is cached on-chip for fast repeated reads.
-// c_preflop_lut[h0 * 52 + h1] = preflop bucket [0..49]
+// c_preflop_lut[h0 * 52 + h1] = preflop bucket [0..PREFLOP_BUCKETS-1]
 // ---------------------------------------------------------------------------
 __constant__ uint8_t c_preflop_lut[52 * 52];
 
@@ -160,7 +160,7 @@ __constant__ uint8_t c_preflop_lut[52 * 52];
 // Info-set hash function (FNV-1a 32-bit, GPU-friendly)
 //
 // Maps (player, hole_bucket, board_bucket, street, action_history) to a
-// slot in the 2M-entry hash table.  Uses power-of-2 modulo (bitwise AND).
+// slot in the fixed-size hash table. Uses power-of-2 modulo (bitwise AND).
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ uint32_t
 info_set_hash(uint8_t player, uint8_t hole_bucket, uint8_t board_bucket,
@@ -205,9 +205,9 @@ valid_mask_gpu(int pot, int stack, int to_call,
         : current_bet + max(last_full_raise, bb_amt);
     const int max_raise_to = current_bet + head;
     if (max_raise_to >= min_raise_to) {
-        if (max(min_raise_to, current_bet + max(1, pot / 4)) <= max_raise_to) mask |= (1 << 3);
+        if (min_raise_to <= max_raise_to)                                          mask |= (1 << 3);
         if (max(min_raise_to, current_bet + max(1, pot / 2)) <= max_raise_to) mask |= (1 << 4);
-        if (max(min_raise_to, current_bet + max(1, pot / 3)) <= max_raise_to) mask |= (1 << 5);
+        if (max(min_raise_to, current_bet + max(1, (2 * pot) / 3)) <= max_raise_to) mask |= (1 << 5);
         if (max(min_raise_to, current_bet + max(1, pot))     <= max_raise_to) mask |= (1 << 6);
     }
     mask |= (1 << 7);                                  // ALL_IN
@@ -233,7 +233,7 @@ chips_for_action_gpu(int a, int pot, int stack, int to_call,
         case 6: {
             int target_raise_to = min_raise_to;
             if (a == 4) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 2));
-            if (a == 5) target_raise_to = max(min_raise_to, current_bet + max(1, pot / 3));
+            if (a == 5) target_raise_to = max(min_raise_to, current_bet + max(1, (2 * pot) / 3));
             if (a == 6) target_raise_to = max(min_raise_to, current_bet + max(1, pot));
             target_raise_to = min(target_raise_to, max_raise_to);
             return min(to_call + max(0, target_raise_to - current_bet), stack);
@@ -342,9 +342,12 @@ void kernel_regret_matching(
     for (int a = 0; a < GPU_NUM_ACTIONS; a++) sum += smem[local_is][a];
     float my_r = smem[local_is][action];
 
-    // Coalesced BF16 store: same access pattern as load
+    // Coalesced BF16 store: same access pattern as load.
+    // Untouched info-sets (sum≈0) write 0 so that sample_action's passive
+    // fallback fires — otherwise a uniform 1/8 prior lets ALL_IN dominate
+    // on cold {FOLD, ALL_IN}-only info-sets.
     strategy[action * table_size + info_set] =
-        __float2bfloat16((sum > 1e-7f) ? (my_r / sum) : (1.0f / GPU_NUM_ACTIONS));
+        __float2bfloat16((sum > 1e-7f) ? (my_r / sum) : 0.0f);
 }
 
 // =============================================================================
@@ -481,8 +484,8 @@ board_bucket_gpu(uint8_t h0, uint8_t h1, const uint8_t* comm, int street)
         rank = eval6_gpu(h0, h1, comm[0], comm[1], comm[2], comm[3]); // turn: 4 comm cards
     else
         rank = eval5_gpu(h0, h1, comm[0], comm[1], comm[2]);           // flop: 3 comm cards
-    // Map [1..7462] → [0..49] bucket
-    return (uint8_t)((uint32_t)(rank - 1) * 50u / 7462u);
+    // Map [1..7462] → [0..POSTFLOP_BUCKETS-1] bucket
+    return (uint8_t)((uint32_t)(rank - 1) * POSTFLOP_BUCKETS / 7462u);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,8 +574,10 @@ apply_action_gpu(ThreadGame& g, int player, int a)
 
 static __device__ void rebuild_queue(ThreadGame& g, int raiser)
 {
+    // Action after a raise goes to every other still-active player exactly
+    // once and ends BEFORE the raiser (who only reacts if someone re-raises).
     g.n_to_act = 0;
-    for (int i = 1; i <= g.N; i++) {
+    for (int i = 1; i < g.N; i++) {
         int p = (raiser + i) % g.N;
         if (!(g.folded & (1u << p)) && !(g.all_in & (1u << p)))
             g.to_act[g.n_to_act++] = p;
@@ -700,15 +705,50 @@ traverse_gpu(ThreadGame& g,
                 ranks[p] = (uint16_t)((g.hole[p*2] % 13) + (g.hole[p*2+1] % 13) + 1);
             }
         }
-        uint16_t best = 0;
-        for (int p = 0; p < g.N; p++)
-            if (!(g.folded & (1u << p))) best = max(best, ranks[p]);
-        int n_win = 0;
-        for (int p = 0; p < g.N; p++)
-            if (!(g.folded & (1u << p)) && ranks[p] == best) n_win++;
+        // Side-pot-aware showdown:
+        //   Layer the pot by distinct invested[] levels. At each layer L,
+        //   chips = Σ_q max(0, min(invested[q], L) - prev). Eligible winners
+        //   are non-folded players with invested[q] >= L; split equally.
+        int levels[GPU_MAX_PLAYERS]; int nL = 0;
+        for (int p = 0; p < g.N; p++) {
+            int inv = g.invested[p];
+            if (inv == 0) continue;
+            bool dup = false;
+            for (int j = 0; j < nL; j++) if (levels[j] == inv) { dup = true; break; }
+            if (!dup) levels[nL++] = inv;
+        }
+        // Bubble sort ascending (N<=6)
+        for (int i = 0; i < nL; i++)
+            for (int j = i + 1; j < nL; j++)
+                if (levels[j] < levels[i]) {
+                    int t = levels[i]; levels[i] = levels[j]; levels[j] = t;
+                }
+
         float payoff = -(float)g.invested[update_player];
-        if (!(g.folded & (1u << update_player)) && ranks[update_player] == best)
-            payoff += (float)g.pot / (float)n_win;
+        int prev = 0;
+        for (int li = 0; li < nL; li++) {
+            int L = levels[li];
+            int layer_pot = 0;
+            for (int q = 0; q < g.N; q++)
+                layer_pot += max(0, min(g.invested[q], L) - prev);
+
+            uint16_t layer_best = 0;
+            for (int q = 0; q < g.N; q++)
+                if (!(g.folded & (1u << q)) && g.invested[q] >= L)
+                    layer_best = max(layer_best, ranks[q]);
+
+            if (layer_best > 0) {
+                int n_win = 0;
+                for (int q = 0; q < g.N; q++)
+                    if (!(g.folded & (1u << q)) && g.invested[q] >= L
+                        && ranks[q] == layer_best) n_win++;
+                if (!(g.folded & (1u << update_player))
+                    && g.invested[update_player] >= L
+                    && ranks[update_player] == layer_best)
+                    payoff += (float)layer_pot / (float)n_win;
+            }
+            prev = L;
+        }
         return payoff;
     }
 
@@ -772,10 +812,13 @@ traverse_gpu(ThreadGame& g,
                                       depth + 1);
         restore_action(g, saved);
 
-        // EV estimate for this info-set (unbiased under OS sampling).
-        float ev = strat[sampled] * child_ev;
+        // OS-MCCFR unbiased info-set value estimate: when a_hat is sampled
+        // with q = σ(a_hat|I), ~v(I, a_hat) = u/q and ~v(I, a != a_hat) = 0,
+        // so ~v(I) = Σ_a σ(a|I) ~v(I,a) = σ(a_hat) · (u/σ(a_hat)) = u.
+        float ev = child_ev;
 
-        // Variance-reduction baseline (EMA).
+        // Variance-reduction baseline (EMA) — updated for instrumentation but
+        // not yet subtracted from regret estimates.
         float b = ev_baseline[info_idx];
         ev_baseline[info_idx] = b + 0.02f * (ev - b);
 
@@ -1454,7 +1497,12 @@ bool GPUCFRTrainer::load_checkpoint(const std::string& path)
     f.read((char*)&magic, sizeof(magic));
     f.read((char*)&ts,    sizeof(ts));
     f.read((char*)&na,    sizeof(na));
-    if (ts != GPU_TABLE_SIZE || na != GPU_NUM_ACTIONS) return false;
+    if (ts != GPU_TABLE_SIZE || na != GPU_NUM_ACTIONS) {
+        fprintf(stderr,
+                "ERROR: checkpoint %s was saved with table_size=%u num_actions=%u, but this build expects %u and %u.\n",
+                path.c_str(), ts, na, (unsigned)GPU_TABLE_SIZE, (unsigned)GPU_NUM_ACTIONS);
+        return false;
+    }
 
     size_t n = (size_t)na * ts;
     std::vector<float> reg(n), ssum(n);

@@ -63,6 +63,7 @@ static void print_usage(const char* prog)
         "  --strategy  <file>                  strategy to use for all bot seats\n"
         "  --players   <N>                     2-9 players (seat 0 is you; default: 2)\n"
         "  --hands     <N>                     total hands in session (default: 10000)\n"
+        "                                      preset raises: [3]=min [4]=1/2 pot [5]=2/3 pot [6]=pot\n"
         "  --show-all-cards                    reveal every seat's hole cards during play\n",
         prog);
 }

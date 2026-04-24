@@ -6,8 +6,8 @@
 // ---------------------------------------------------------------------------
 // Card abstraction: maps hands to integer buckets
 // ---------------------------------------------------------------------------
-constexpr int PREFLOP_BUCKETS  = 50;
-constexpr int POSTFLOP_BUCKETS = 50;
+constexpr int PREFLOP_BUCKETS  = 64;
+constexpr int POSTFLOP_BUCKETS = 128;
 
 // Initialize preflop percentile table (call once at startup)
 void abstraction_init();
@@ -43,9 +43,9 @@ enum class Action : uint8_t {
     FOLD          = 0,
     CHECK         = 1,
     CALL          = 2,
-    RAISE_QUARTER = 3,   // 1/4 pot
+    RAISE_MIN     = 3,   // minimum legal raise
     RAISE_HALF    = 4,   // 1/2 pot
-    RAISE_THIRD   = 5,   // 1/3 pot (kept for compatibility)
+    RAISE_TWO_THIRDS = 5, // 2/3 pot
     RAISE_POT     = 6,   // 1x pot
     ALL_IN        = 7,
     NUM_ACTIONS   = 8
@@ -54,7 +54,7 @@ constexpr int NUM_ACTIONS = static_cast<int>(Action::NUM_ACTIONS);
 
 static const char* ACTION_NAME[] = {
     "fold", "check", "call",
-    "raise_quarter", "raise_half", "raise_third", "raise_pot", "all_in"
+    "raise_min", "raise_half", "raise_two_thirds", "raise_pot", "all_in"
 };
 
 // Returns bitmask of valid actions (bit i = Action i is valid)

@@ -59,7 +59,7 @@ int preflop_bucket(Card h0, Card h1) {
 }
 
 // ---------------------------------------------------------------------------
-// Fast postflop bucket (rank-based, no MC — used in CFR hot path)
+// Fast postflop bucket (rank-strength based, no MC — used in CFR hot path)
 // ---------------------------------------------------------------------------
 int fast_postflop_bucket(Card h0, Card h1,
                           const Card* community, int n_comm) {
@@ -73,7 +73,7 @@ int fast_postflop_bucket(Card h0, Card h1,
 }
 
 // ---------------------------------------------------------------------------
-// Postflop bucket via Monte Carlo equity (used in live bot, not CFR training)
+// Postflop bucket via Monte Carlo equity (available for CPU-side analysis/live bot)
 // ---------------------------------------------------------------------------
 int postflop_bucket(Card h0, Card h1,
                     const Card* community, int n_comm,
@@ -156,10 +156,10 @@ static int raise_target_for_action(Action a, int pot, int current_bet,
                                    int min_raise_to)
 {
     switch (a) {
-        case Action::RAISE_QUARTER: return std::max(min_raise_to, current_bet + std::max(1, pot / 4));
-        case Action::RAISE_HALF:    return std::max(min_raise_to, current_bet + std::max(1, pot / 2));
-        case Action::RAISE_THIRD:   return std::max(min_raise_to, current_bet + std::max(1, pot / 3));
-        case Action::RAISE_POT:     return std::max(min_raise_to, current_bet + std::max(1, pot));
+        case Action::RAISE_MIN:        return min_raise_to;
+        case Action::RAISE_HALF:       return std::max(min_raise_to, current_bet + std::max(1, pot / 2));
+        case Action::RAISE_TWO_THIRDS: return std::max(min_raise_to, current_bet + std::max(1, (2 * pot) / 3));
+        case Action::RAISE_POT:        return std::max(min_raise_to, current_bet + std::max(1, pot));
         default:                    return min_raise_to;
     }
 }
@@ -186,12 +186,12 @@ uint8_t valid_actions_mask(int pot, int stack, int to_call,
     const int max_raise_to = current_bet + headroom;
     const int min_raise_to = min_raise_to_total(current_bet, last_full_raise, bb_amt);
     if (max_raise_to >= min_raise_to) {
-        if (raise_target_for_action(Action::RAISE_QUARTER, pot, current_bet, min_raise_to) <= max_raise_to)
-            mask |= (1 << (int)Action::RAISE_QUARTER);
+        if (raise_target_for_action(Action::RAISE_MIN, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_MIN);
         if (raise_target_for_action(Action::RAISE_HALF, pot, current_bet, min_raise_to) <= max_raise_to)
             mask |= (1 << (int)Action::RAISE_HALF);
-        if (raise_target_for_action(Action::RAISE_THIRD, pot, current_bet, min_raise_to) <= max_raise_to)
-            mask |= (1 << (int)Action::RAISE_THIRD);
+        if (raise_target_for_action(Action::RAISE_TWO_THIRDS, pot, current_bet, min_raise_to) <= max_raise_to)
+            mask |= (1 << (int)Action::RAISE_TWO_THIRDS);
         if (raise_target_for_action(Action::RAISE_POT, pot, current_bet, min_raise_to) <= max_raise_to)
             mask |= (1 << (int)Action::RAISE_POT);
     }
@@ -219,9 +219,9 @@ int action_to_chips(Action a, int pot, int stack, int to_call,
         case Action::FOLD:          return 0;
         case Action::CHECK:         return 0;
         case Action::CALL:          return std::min(to_call, stack);
-        case Action::RAISE_QUARTER:
+        case Action::RAISE_MIN:
         case Action::RAISE_HALF:
-        case Action::RAISE_THIRD:
+        case Action::RAISE_TWO_THIRDS:
         case Action::RAISE_POT: {
             const int raise_to = std::min(
                 raise_target_for_action(a, pot, current_bet, min_raise_to),
