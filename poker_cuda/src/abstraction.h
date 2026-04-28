@@ -6,8 +6,8 @@
 // ---------------------------------------------------------------------------
 // Card abstraction: maps hands to integer buckets
 // ---------------------------------------------------------------------------
-constexpr int PREFLOP_BUCKETS  = 64;
-constexpr int POSTFLOP_BUCKETS = 128;
+constexpr int PREFLOP_BUCKETS  = 128;   // 2× for 6-player preflop diversity
+constexpr int POSTFLOP_BUCKETS = 256;   // max uint8_t; finer equity resolution for 6-way pots
 
 // Initialize preflop percentile table (call once at startup)
 void abstraction_init();

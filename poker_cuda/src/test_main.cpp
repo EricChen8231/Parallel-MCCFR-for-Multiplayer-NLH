@@ -177,28 +177,28 @@ static void test_abstraction()
 {
     SECTION("Module 2a — Preflop Buckets");
 
-    // 2a.1 Pocket aces: Ac=12, Ad=25 → highest bucket (63)
+    // 2a.1 Pocket aces: Ac=12, Ad=25 → highest bucket (127)
     int aa_bucket = preflop_bucket(12, 25);
-    EXPECT_EQ(aa_bucket, PREFLOP_BUCKETS - 1, "AA bucket == max (63)");
+    EXPECT_EQ(aa_bucket, PREFLOP_BUCKETS - 1, "AA bucket == max (127)");
 
     // 2a.2 Pocket kings: Kc=11, Kd=24 → near top
     int kk_bucket = preflop_bucket(11, 24);
-    EXPECT_RANGE(kk_bucket, 58, 63, "KK bucket in [58, 63]");
+    EXPECT_RANGE(kk_bucket, 116, 127, "KK bucket in [116, 127]");
 
     // 2a.3 72 offsuit: 2c=0, 7d=18 → near bottom
     int worst = preflop_bucket(0, 18);
-    EXPECT_RANGE(worst, 0, 5, "72o bucket in [0, 5]");
+    EXPECT_RANGE(worst, 0, 10, "72o bucket in [0, 10]");
 
     // 2a.4 AKs: Ac=12, Ks=50 → near top
     int aks = preflop_bucket(12, 50);
-    EXPECT_RANGE(aks, 55, 63, "AKs bucket in [55, 63]");
+    EXPECT_RANGE(aks, 110, 127, "AKs bucket in [110, 127]");
 
     // 2a.5 Symmetry: (h0,h1) and (h1,h0) give same bucket
     int b01 = preflop_bucket(12, 50);
     int b10 = preflop_bucket(50, 12);
     EXPECT_EQ(b01, b10, "preflop_bucket symmetric: (AcKs)==(KsAc)");
 
-    // 2a.6 All 1326 unique combos produce values in [0, 63]
+    // 2a.6 All 1326 unique combos produce values in [0, 127]
     {
         bool all_valid = true;
         for (int i = 0; i < 52 && all_valid; i++)
@@ -206,7 +206,7 @@ static void test_abstraction()
                 int b = preflop_bucket((Card)i, (Card)j);
                 if (b < 0 || b >= PREFLOP_BUCKETS) all_valid = false;
             }
-        EXPECT(all_valid, "All 1326 preflop combos produce bucket in [0, 63]");
+        EXPECT(all_valid, "All 1326 preflop combos produce bucket in [0, 127]");
     }
 
     // 2a.7 AA > KK > AKs > 72o (ordering sanity)
@@ -225,21 +225,21 @@ static void test_abstraction()
         {
             Card royalboard[5] = {38, 37, 36, 35, 34};
             int top_bucket = fast_postflop_bucket(12, 50, royalboard, 5);
-            EXPECT_EQ(top_bucket, POSTFLOP_BUCKETS - 1, "Royal flush board → max postflop bucket (127)");
+            EXPECT_EQ(top_bucket, POSTFLOP_BUCKETS - 1, "Royal flush board → max postflop bucket (255)");
         }
 
         // 2b.2 Low board: 7c=5 8d=19 9h=33 + hole 2c=0 2d=13
         {
             Card lowboard[3] = {5, 19, 33};
             int low_bucket = fast_postflop_bucket(0, 13, lowboard, 3);
-            EXPECT_RANGE(low_bucket, 0, 127, "Low board bucket in [0, 127]");
+            EXPECT_RANGE(low_bucket, 0, 255, "Low board bucket in [0, 255]");
         }
 
-        // 2b.3 Boundary: max rank maps to bucket 127
-        // (7462-1)*128/7462 = 7461*128/7462 = 955008/7462 = 127 (integer division)
+        // 2b.3 Boundary: max rank maps to bucket 255
+        // (7462-1)*256/7462 = 7461*256/7462 = 1910016/7462 = 255 (integer division)
         {
             uint32_t val = (uint32_t)(7462 - 1) * (uint32_t)POSTFLOP_BUCKETS / 7462u;
-            EXPECT_EQ((int)val, POSTFLOP_BUCKETS - 1, "rank=7462 maps to bucket 127 via formula");
+            EXPECT_EQ((int)val, POSTFLOP_BUCKETS - 1, "rank=7462 maps to bucket 255 via formula");
         }
 
         // 2b.4 Boundary: rank=1 maps to bucket 0

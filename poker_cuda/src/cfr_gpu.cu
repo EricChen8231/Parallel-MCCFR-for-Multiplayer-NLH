@@ -1346,12 +1346,10 @@ void GPUCFRTrainer::train(long long total_iterations, int batch_size, bool verbo
     init_rng(batch_size);
     upload_preflop_lut();
 
-    // traverse_gpu can recurse ~20 levels for 2-player games; each frame holds
-    // a ~256-byte ThreadGame copy plus local vars (~400 bytes/frame total).
-    // 16 kB (= ~40 frames) is sufficient for --players 2.
-    // For --players 6 with deeper trees, increase to 32768 at the cost of
-    // reduced SM occupancy (~150x throughput penalty due to L2 pressure).
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 16384));
+    // traverse_gpu can recurse ~20 levels; each frame ~400 bytes (ActionState + locals).
+    // 32 kB (~80 frames) handles 6-player games with multiple re-raises per street.
+    // Cost: ~10-15% SM occupancy reduction vs 16 kB, acceptable on A100.
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 32768));
 
     if (verbose)
         printf("Training: %lld iters, batch=%d, players=%d, CFR+=%s, LCFR=%s\n",

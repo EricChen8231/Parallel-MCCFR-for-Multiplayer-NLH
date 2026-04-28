@@ -23,7 +23,7 @@ static constexpr uint64_t CHECKPOINT_MAGIC_V2 = 0x43465247505501ULL;
 // GPU-side constants
 // ---------------------------------------------------------------------------
 static constexpr int      GPU_NUM_ACTIONS = 8;
-static constexpr int      GPU_TABLE_SIZE  = 1 << 26;   // 67.1M info-set slots
+static constexpr int      GPU_TABLE_SIZE  = 1 << 28;   // 268M info-set slots (~22 GB on A100; 4× 2-player size for 6-player game tree)
 static constexpr int      GPU_BLOCK_SIZE  = 256;        // simulation kernel threads/block
 static constexpr int      GPU_MAX_PLAYERS = 6;
 
