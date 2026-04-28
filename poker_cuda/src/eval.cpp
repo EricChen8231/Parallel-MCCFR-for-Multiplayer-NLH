@@ -19,6 +19,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <random>
 #include <algorithm>
 #include <vector>
@@ -1440,4 +1441,179 @@ void play_vs_human(const HostStrategyTable& strat, int n_players, long long n_ha
            hands_played, net_bb,
            hands_played > 0 ? net_bb / (double)hands_played * 100.0 : 0.0);
     printf("================================================================\n");
+}
+
+// =============================================================================
+// Self-play: trained strategy A vs trained strategy B, heads-up.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Play one hand with two trained strategies.
+// player_a: which seat (0 or 1) uses strat_a; the other seat uses strat_b.
+// Returns net chips won by player_a.
+// ---------------------------------------------------------------------------
+static int play_hand_selfplay(Game2P& g, Deck& deck, std::mt19937& rng,
+                               int player_a,
+                               const HostStrategyTable& strat_a,
+                               const HostStrategyTable& strat_b,
+                               int starting_stack, int sb_amt, int bb_amt)
+{
+    deck.shuffle(rng);
+    for (int p = 0; p < 2; p++) { g.hole[p][0] = deck.deal(); g.hole[p][1] = deck.deal(); }
+    for (int i = 0; i < 5; i++) g.community[i] = deck.deal();
+
+    for (int p = 0; p < 2; p++) {
+        g.stacks[p] = starting_stack; g.bets[p] = 0; g.invested[p] = 0;
+        g.folded[p] = false; g.all_in_flag[p] = false;
+    }
+    g.pot = 0; g.current_bet = 0; g.last_full_raise = bb_amt; g.bb_amt = bb_amt;
+    g.action_bits = 0; g.street = 0;
+
+    int s0 = std::min(sb_amt, g.stacks[0]);
+    g.stacks[0] -= s0; g.bets[0] = s0; g.invested[0] = s0;
+    int b1 = std::min(bb_amt, g.stacks[1]);
+    g.stacks[1] -= b1; g.bets[1] = b1; g.invested[1] = b1;
+    g.pot = s0 + b1; g.current_bet = b1;
+    if (!g.stacks[0]) g.all_in_flag[0] = true;
+    if (!g.stacks[1]) g.all_in_flag[1] = true;
+
+    Card hole_flat[4] = { g.hole[0][0], g.hole[0][1], g.hole[1][0], g.hole[1][1] };
+    int hb[2], bb_flat[8];
+    precompute_buckets(hole_flat, g.community, 2, hb, bb_flat);
+    for (int p = 0; p < 2; p++) {
+        g.hole_buckets[p] = hb[p];
+        for (int s = 0; s < 4; s++) g.board_buckets[p][s] = bb_flat[p * 4 + s];
+    }
+
+    static const int fta_sp[4] = { 0, 1, 1, 1 };
+    int player_b = 1 - player_a;
+
+    for (int st = 0; st < 4; st++) {
+        g.street = st;
+        if (st > 0) { g.bets[0] = g.bets[1] = 0; g.current_bet = 0; g.last_full_raise = bb_amt; }
+
+        int active = (!g.folded[0] ? 1 : 0) + (!g.folded[1] ? 1 : 0);
+        if (active <= 1) break;
+
+        bool needs_to_act[2];
+        for (int p = 0; p < 2; p++)
+            needs_to_act[p] = !g.folded[p] && !g.all_in_flag[p];
+
+        int p = fta_sp[st];
+        bool folded_out = false;
+        for (int guard = 0; guard < 20 && (needs_to_act[0] || needs_to_act[1]); guard++) {
+            if (!needs_to_act[p]) { p = 1 - p; continue; }
+
+            int to_call = g.current_bet - g.bets[p];
+            uint8_t vm = valid_actions_mask(g.pot, g.stacks[p], to_call,
+                                            g.current_bet, g.last_full_raise, g.bb_amt);
+
+            const HostStrategyTable& strat_for_p = (p == player_a) ? strat_a : strat_b;
+            int chosen = trained_action(strat_for_p, (uint8_t)p,
+                                        (uint8_t)g.hole_buckets[p],
+                                        (uint8_t)g.board_buckets[p][st],
+                                        (uint8_t)st, g.action_bits, vm, rng);
+
+            g.action_bits = ((g.action_bits << 3) | (uint32_t)chosen) & 0x3FFFFFFFu;
+            needs_to_act[p] = false;
+
+            if (chosen == 0) { g.folded[p] = true; folded_out = true; break; }
+            if (chosen != 1) {
+                int chips = action_to_chips((Action)chosen, g.pot, g.stacks[p], to_call,
+                                            g.current_bet, g.last_full_raise, g.bb_amt);
+                const int prev_bet = g.current_bet;
+                g.stacks[p] -= chips; g.bets[p] += chips; g.invested[p] += chips; g.pot += chips;
+                if (!g.stacks[p]) { g.all_in_flag[p] = true; needs_to_act[p] = false; }
+                if (g.bets[p] > g.current_bet) {
+                    int raise_size = g.bets[p] - prev_bet;
+                    if (raise_size >= g.last_full_raise || prev_bet == 0)
+                        g.last_full_raise = raise_size;
+                    g.current_bet = g.bets[p];
+                    needs_to_act[1-p] = !g.folded[1-p] && !g.all_in_flag[1-p];
+                }
+            }
+            p = 1 - p;
+        }
+        if (folded_out) break;
+        active = (!g.folded[0] ? 1 : 0) + (!g.folded[1] ? 1 : 0);
+        if (active <= 1 || st == 3) break;
+    }
+
+    if (g.folded[player_b]) return g.pot - g.invested[player_a];
+    if (g.folded[player_a]) return -g.invested[player_a];
+
+    uint16_t ra = evaluate_7cards(g.hole[player_a][0], g.hole[player_a][1],
+        g.community[0], g.community[1], g.community[2], g.community[3], g.community[4]);
+    uint16_t rb = evaluate_7cards(g.hole[player_b][0], g.hole[player_b][1],
+        g.community[0], g.community[1], g.community[2], g.community[3], g.community[4]);
+    if (ra > rb) return g.pot - g.invested[player_a];
+    if (rb > ra) return -g.invested[player_a];
+    return g.pot / 2 - g.invested[player_a];
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+SelfplayResult evaluate_selfplay(const HostStrategyTable& strat_a,
+                                  const HostStrategyTable& strat_b,
+                                  long long n_hands, int stack, int sb, int bb,
+                                  unsigned seed)
+{
+    std::mt19937 rng(seed);
+    Deck deck;
+    Game2P g;
+
+    double sum = 0.0, sum2 = 0.0;
+    for (long long h = 0; h < n_hands; h++) {
+        // Alternate which seat strategy A occupies for position fairness.
+        int player_a = (int)(h & 1);
+        int net = play_hand_selfplay(g, deck, rng, player_a, strat_a, strat_b, stack, sb, bb);
+        double bb_won = (double)net / (double)bb;
+        sum  += bb_won;
+        sum2 += bb_won * bb_won;
+    }
+
+    SelfplayResult res;
+    res.hands_played = n_hands;
+    res.bb_per_100   = sum / (double)n_hands * 100.0;
+
+    double mean = sum / (double)n_hands;
+    double var  = sum2 / (double)n_hands - mean * mean;
+    res.std_dev      = std::sqrt(std::max(0.0, var));
+    res.ci95_margin  = 1.96 * res.std_dev / std::sqrt((double)n_hands) * 100.0;
+    return res;
+}
+
+// =============================================================================
+// Strategy diff: measure L1 divergence between two strategies.
+// Useful as a convergence proxy: if avg_l1_dist is small, training converged.
+// =============================================================================
+StratDiffResult compare_strategies(const HostStrategyTable& strat_a,
+                                    const HostStrategyTable& strat_b)
+{
+    StratDiffResult r;
+    r.total_a    = strat_a.size();
+    r.total_b    = strat_b.size();
+    r.shared_sets = 0;
+    r.avg_l1_dist = 0.0;
+    r.max_l1_dist = 0.0;
+
+    // Walk the smaller map for efficiency
+    const HostStrategyTable& smaller = (strat_a.size() <= strat_b.size()) ? strat_a : strat_b;
+    const HostStrategyTable& larger  = (strat_a.size() <= strat_b.size()) ? strat_b : strat_a;
+
+    for (const auto& [key, ea] : smaller) {
+        auto it = larger.find(key);
+        if (it == larger.end()) continue;
+        const auto& eb = it->second;
+        double l1 = 0.0;
+        for (int a = 0; a < GPU_NUM_ACTIONS; a++)
+            l1 += std::fabs((double)ea.probs[a] - (double)eb.probs[a]);
+        r.shared_sets++;
+        r.avg_l1_dist += l1;
+        if (l1 > r.max_l1_dist) r.max_l1_dist = l1;
+    }
+    if (r.shared_sets > 0)
+        r.avg_l1_dist /= (double)r.shared_sets;
+    return r;
 }

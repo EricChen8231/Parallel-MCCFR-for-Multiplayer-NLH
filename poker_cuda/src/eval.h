@@ -70,6 +70,51 @@ EvalResult evaluate_strategy_np(
     unsigned                 seed  = 42);
 
 // ---------------------------------------------------------------------------
+// evaluate_selfplay
+//
+// Plays n_hands heads-up: strat_a vs strat_b. Positions alternate each hand.
+// Returns bb_per_100 from strat_a's perspective (positive = A wins).
+// Includes per-hand std dev and 95% CI margin for statistical significance.
+//
+// Requires hand_eval_init() and abstraction_init() to have been called.
+// ---------------------------------------------------------------------------
+struct SelfplayResult {
+    long long hands_played;
+    double    bb_per_100;    // positive = strategy A is winning
+    double    std_dev;       // per-hand standard deviation in BB
+    double    ci95_margin;   // 95% CI half-width in BB/100
+};
+
+SelfplayResult evaluate_selfplay(
+    const HostStrategyTable& strat_a,
+    const HostStrategyTable& strat_b,
+    long long                n_hands,
+    int                      stack = 1000,
+    int                      sb    = 10,
+    int                      bb    = 20,
+    unsigned                 seed  = 42);
+
+// ---------------------------------------------------------------------------
+// compare_strategies
+//
+// Measures the L1 divergence between two strategy tables.
+// avg_l1_dist in [0, 2]: 0 = identical, 2 = maximally different.
+// Use as a convergence proxy: if avg_l1_dist < ~0.05, training has converged
+// within the abstraction.
+// ---------------------------------------------------------------------------
+struct StratDiffResult {
+    size_t total_a;       // info sets in strat_a
+    size_t total_b;       // info sets in strat_b
+    size_t shared_sets;   // info sets present in both
+    double avg_l1_dist;   // average L1 distance over shared info sets [0, 2]
+    double max_l1_dist;   // max L1 distance of any single info set
+};
+
+StratDiffResult compare_strategies(
+    const HostStrategyTable& strat_a,
+    const HostStrategyTable& strat_b);
+
+// ---------------------------------------------------------------------------
 // play_vs_human
 //
 // Interactive session: human vs. trained bots.

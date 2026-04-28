@@ -53,6 +53,16 @@ static void print_usage(const char* prog)
         "                                      (default: calling_station)\n"
         "  --hands     <N>                     number of hands to play (default: 10000)\n"
         "\n"
+        "Selfplay flags (--mode selfplay):\n"
+        "  --strategy  <file>                  strategy A (first player)\n"
+        "  --strategy2 <file>                  strategy B (second player)\n"
+        "  --hands     <N>                     number of hands (default: 10000; use >=200K for tight CIs)\n"
+        "\n"
+        "Diff flags (--mode diff):\n"
+        "  --strategy  <file>                  strategy A\n"
+        "  --strategy2 <file>                  strategy B\n"
+        "  (measures L1 divergence as a convergence proxy)\n"
+        "\n"
         "Play flags (--mode play):\n"
         "  --strategy  <file>                  strategy to use for the bot\n"
         "  --opponent  <type>                  scripted archetype (default: calling_station)\n"
@@ -119,27 +129,29 @@ int main(int argc, char* argv[])
     std::string hr_path        = "data/handranks.dat";
     // eval / play mode flags
     std::string strategy_path;
+    std::string strategy2_path;   // second strategy for selfplay / diff
     std::string opponent_str   = "calling_station";
     long long   eval_hands     = 10000;
     int         window_size    = 50;
     bool        show_all_cards = false;
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--mode")       && i+1<argc) mode          = argv[++i];
-        else if (!strcmp(argv[i], "--players")    && i+1<argc) n_players     = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--iters")      && i+1<argc) iters         = atoll(argv[++i]);
-        else if (!strcmp(argv[i], "--batch")      && i+1<argc) batch_size    = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--stack")      && i+1<argc) stack_size    = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--sb")         && i+1<argc) sb            = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bb")         && i+1<argc) bb            = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--save")       && i+1<argc) save_path     = argv[++i];
-        else if (!strcmp(argv[i], "--load")       && i+1<argc) load_path     = argv[++i];
-        else if (!strcmp(argv[i], "--handranks")  && i+1<argc) hr_path       = argv[++i];
-        else if (!strcmp(argv[i], "--strategy")   && i+1<argc) strategy_path = argv[++i];
-        else if (!strcmp(argv[i], "--opponent")   && i+1<argc) opponent_str  = argv[++i];
-        else if (!strcmp(argv[i], "--hands")      && i+1<argc) eval_hands    = atoll(argv[++i]);
-        else if (!strcmp(argv[i], "--window")     && i+1<argc) window_size   = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--show-all-cards"))         show_all_cards = true;
+        if      (!strcmp(argv[i], "--mode")       && i+1<argc) mode           = argv[++i];
+        else if (!strcmp(argv[i], "--players")    && i+1<argc) n_players      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--iters")      && i+1<argc) iters          = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "--batch")      && i+1<argc) batch_size     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stack")      && i+1<argc) stack_size     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sb")         && i+1<argc) sb             = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bb")         && i+1<argc) bb             = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--save")       && i+1<argc) save_path      = argv[++i];
+        else if (!strcmp(argv[i], "--load")       && i+1<argc) load_path      = argv[++i];
+        else if (!strcmp(argv[i], "--handranks")  && i+1<argc) hr_path        = argv[++i];
+        else if (!strcmp(argv[i], "--strategy")   && i+1<argc) strategy_path  = argv[++i];
+        else if (!strcmp(argv[i], "--strategy2")  && i+1<argc) strategy2_path = argv[++i];
+        else if (!strcmp(argv[i], "--opponent")   && i+1<argc) opponent_str   = argv[++i];
+        else if (!strcmp(argv[i], "--hands")      && i+1<argc) eval_hands     = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "--window")     && i+1<argc) window_size    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--show-all-cards"))          show_all_cards = true;
         else if (!strcmp(argv[i], "--no-cfrplus"))  use_cfr_plus   = false;
         else if (!strcmp(argv[i], "--cfrplus"))     use_cfr_plus   = true;
         else if (!strcmp(argv[i], "--no-lcfr"))     use_linear_cfr = false;
@@ -292,6 +304,128 @@ int main(int argc, char* argv[])
         play_vs_human(strat, n_players, eval_hands, stack_size, sb, bb,
                       show_all_cards, /*seed=*/42);
 
+#ifdef USE_MPI
+        MPI_Finalize();
+#endif
+        return 0;
+    }
+
+    // =========================================================================
+    // SELFPLAY mode: CPU-only, trained strategy A vs trained strategy B.
+    //
+    // Compares two strategy files head-to-head and reports BB/100 with a 95%
+    // confidence interval.  Use this to:
+    //   - Verify that more training improved quality (load early vs late ckpt)
+    //   - Measure how much a change to the abstraction / CFR parameters matters
+    //
+    // Example:
+    //   ./poker_cuda --mode selfplay --strategy test_strategy.bin \
+    //                --strategy2 strategy_5h.bin --hands 200000
+    // =========================================================================
+    if (mode == "selfplay") {
+        abstraction_init();
+        if (!hand_eval_init(hr_path.c_str())) {
+            fprintf(stderr, "ERROR: Could not load handranks.dat from %s\n", hr_path.c_str());
+            return 1;
+        }
+
+        std::string file_a = strategy_path.empty()  ? save_path      : strategy_path;
+        std::string file_b = strategy2_path.empty() ? "strategy2.bin" : strategy2_path;
+
+        printf("Selfplay: loading strategy A from %s ...\n", file_a.c_str());
+        HostStrategyTable strat_a;
+        if (!strategy_load_auto(strat_a, file_a, n_players, stack_size, sb, bb)) {
+            fprintf(stderr, "ERROR: Could not load strategy A from %s\n", file_a.c_str());
+            return 1;
+        }
+        printf("  Loaded %zu info sets.\n", strat_a.size());
+
+        printf("Selfplay: loading strategy B from %s ...\n", file_b.c_str());
+        HostStrategyTable strat_b;
+        if (!strategy_load_auto(strat_b, file_b, n_players, stack_size, sb, bb)) {
+            fprintf(stderr, "ERROR: Could not load strategy B from %s\n", file_b.c_str());
+            return 1;
+        }
+        printf("  Loaded %zu info sets.\n\n", strat_b.size());
+
+        printf("Running %lld hands, alternating seats ...\n\n", eval_hands);
+        SelfplayResult res = evaluate_selfplay(strat_a, strat_b, eval_hands,
+                                               stack_size, sb, bb, /*seed=*/42);
+
+        printf("=== Selfplay Results ===\n");
+        printf("  Hands played : %lld\n", res.hands_played);
+        printf("  A BB/100     : %+.2f  (95%% CI: ± %.2f)\n",
+               res.bb_per_100, res.ci95_margin);
+        printf("  Std dev/hand : %.4f BB\n", res.std_dev);
+        if (res.ci95_margin > 0) {
+            if (res.bb_per_100 - res.ci95_margin > 0)
+                printf("  Verdict      : A is SIGNIFICANTLY BETTER (p < 0.05)\n");
+            else if (res.bb_per_100 + res.ci95_margin < 0)
+                printf("  Verdict      : B is SIGNIFICANTLY BETTER (p < 0.05)\n");
+            else
+                printf("  Verdict      : NOT statistically significant — run more hands\n");
+        }
+        printf("\n  Interpretation:\n");
+        printf("  * Positive = strategy A wins BB/100; negative = B wins.\n");
+        printf("  * Near-Nash strategies should be close to 0 BB/100 vs each other.\n");
+        printf("  * Run >= 500K hands for tight CIs (± ~0.2 BB/100).\n");
+#ifdef USE_MPI
+        MPI_Finalize();
+#endif
+        return 0;
+    }
+
+    // =========================================================================
+    // DIFF mode: CPU-only, measure L1 divergence between two strategy files.
+    //
+    // Reports average and max L1 distance over shared info sets.
+    // Use this as a convergence proxy: if avg_l1_dist < 0.05, the strategy has
+    // essentially converged within the current abstraction.
+    //
+    // Example:
+    //   ./poker_cuda --mode diff --strategy test_strategy.bin \
+    //                --strategy2 strategy_5h.bin
+    // =========================================================================
+    if (mode == "diff") {
+        printf("Loading strategy A from %s ...\n",
+               (strategy_path.empty() ? save_path.c_str() : strategy_path.c_str()));
+        HostStrategyTable strat_a;
+        std::string file_a = strategy_path.empty() ? save_path : strategy_path;
+        if (!strategy_load_auto(strat_a, file_a, n_players, stack_size, sb, bb)) {
+            fprintf(stderr, "ERROR: Could not load strategy A from %s\n", file_a.c_str());
+            return 1;
+        }
+        printf("  Loaded %zu info sets.\n", strat_a.size());
+
+        std::string file_b = strategy2_path.empty() ? "strategy2.bin" : strategy2_path;
+        printf("Loading strategy B from %s ...\n", file_b.c_str());
+        HostStrategyTable strat_b;
+        if (!strategy_load_auto(strat_b, file_b, n_players, stack_size, sb, bb)) {
+            fprintf(stderr, "ERROR: Could not load strategy B from %s\n", file_b.c_str());
+            return 1;
+        }
+        printf("  Loaded %zu info sets.\n\n", strat_b.size());
+
+        StratDiffResult d = compare_strategies(strat_a, strat_b);
+
+        printf("=== Strategy Diff Results ===\n");
+        printf("  Info sets A    : %zu\n", d.total_a);
+        printf("  Info sets B    : %zu\n", d.total_b);
+        printf("  Shared sets    : %zu  (%.1f%% of A)\n",
+               d.shared_sets,
+               d.total_a > 0 ? 100.0 * d.shared_sets / d.total_a : 0.0);
+        printf("  Avg L1 dist    : %.6f  (range [0,2]; 0=identical)\n", d.avg_l1_dist);
+        printf("  Max L1 dist    : %.6f\n", d.max_l1_dist);
+        printf("\n  Convergence guide:\n");
+        printf("  > 0.20  — strategy still changing rapidly (keep training)\n");
+        printf("    0.05-0.20 — noticeable drift (more training helpful)\n");
+        printf("  < 0.05  — essentially converged within this abstraction\n");
+        if (d.avg_l1_dist < 0.05)
+            printf("  Status: CONVERGED\n");
+        else if (d.avg_l1_dist < 0.20)
+            printf("  Status: NEARLY CONVERGED — marginal gains from more training\n");
+        else
+            printf("  Status: STILL TRAINING — significant improvement expected\n");
 #ifdef USE_MPI
         MPI_Finalize();
 #endif
