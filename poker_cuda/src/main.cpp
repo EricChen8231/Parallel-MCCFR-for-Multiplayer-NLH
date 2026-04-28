@@ -70,16 +70,25 @@ static void print_usage(const char* prog)
 
 static void print_gpu_info()
 {
-    int n;
-    cudaGetDeviceCount(&n);
+    int n = 0;
+    cudaError_t err = cudaGetDeviceCount(&n);
+    if (err != cudaSuccess) {
+        printf("GPUs found: 0 (cudaGetDeviceCount failed: %s)\n",
+               cudaGetErrorString(err));
+        return;
+    }
     printf("GPUs found: %d\n", n);
     for (int i = 0; i < n; i++) {
         cudaDeviceProp p;
-        cudaGetDeviceProperties(&p, i);
-        printf("  [%d] %s  SM=%d  VRAM=%.0fGB  BW=%.0fGB/s  L2=%.0fMB\n",
+        cudaError_t perr = cudaGetDeviceProperties(&p, i);
+        if (perr != cudaSuccess) {
+            printf("  [%d] (cudaGetDeviceProperties failed: %s)\n",
+                   i, cudaGetErrorString(perr));
+            continue;
+        }
+        printf("  [%d] %s  SM=%d  VRAM=%.0fGB  L2=%.0fMB\n",
                i, p.name, p.multiProcessorCount,
                p.totalGlobalMem / 1e9,
-               2.0 * p.memoryClockRate * (p.memoryBusWidth / 8) / 1e6,
                p.l2CacheSize / 1e6);
     }
 }

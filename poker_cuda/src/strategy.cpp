@@ -9,7 +9,7 @@
 
 static constexpr uint64_t STRATEGY_MAGIC_V1 = 0x53545241540000ULL;
 static constexpr uint64_t STRATEGY_MAGIC_V2 = 0x53545241540100ULL;
-static constexpr uint64_t CHECKPOINT_MAGIC  = 0x43465247505500ULL;
+// CHECKPOINT_MAGIC_V1 / CHECKPOINT_MAGIC_V2 are defined in cfr_gpu.cuh (included via strategy.h)
 
 static bool peek_magic(const std::string& path, uint64_t& magic)
 {
@@ -57,7 +57,7 @@ bool strategy_load(HostStrategyTable& strat, const std::string& path)
     if (!f) return false;
     uint64_t magic;
     f.read((char*)&magic, sizeof(magic));
-    if (magic == CHECKPOINT_MAGIC) {
+    if (magic == CHECKPOINT_MAGIC_V1 || magic == CHECKPOINT_MAGIC_V2) {
         fprintf(stderr,
                 "ERROR: %s is a training checkpoint, not a playable strategy file.\n"
                 "  Use the exported .bin strategy, not the .ckpt resume file.\n",
@@ -115,10 +115,24 @@ bool strategy_load_auto(HostStrategyTable& strat, const std::string& path,
     uint64_t magic = 0;
     if (!peek_magic(path, magic)) return false;
 
-    if (magic == STRATEGY_MAGIC_V1 || magic == STRATEGY_MAGIC_V2)
+    if (magic == STRATEGY_MAGIC_V1) {
+        fprintf(stderr,
+                "ERROR: %s is an older strategy export format and is incompatible with this build.\n"
+                "  Re-export a strategy from a matching checkpoint or retrain with the current settings.\n",
+                path.c_str());
+        return false;
+    }
+    if (magic == STRATEGY_MAGIC_V2)
         return strategy_load(strat, path);
 
-    if (magic != CHECKPOINT_MAGIC) {
+    if (magic == CHECKPOINT_MAGIC_V1) {
+        fprintf(stderr,
+                "ERROR: %s is an older checkpoint format (V1) and is incompatible with this build.\n"
+                "  You must retrain from scratch with the current bucket settings.\n",
+                path.c_str());
+        return false;
+    }
+    if (magic != CHECKPOINT_MAGIC_V2) {
         fprintf(stderr,
                 "ERROR: %s is neither a strategy .bin nor a checkpoint .ckpt file.\n",
                 path.c_str());

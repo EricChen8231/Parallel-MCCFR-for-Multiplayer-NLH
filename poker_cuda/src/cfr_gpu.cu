@@ -78,6 +78,14 @@
 __device__ static int32_t* g_hr = nullptr;  // set from host via cudaMemcpyToSymbol
 
 // ---------------------------------------------------------------------------
+// eval5 lookup tables in GPU constant memory (uploaded at load_hand_table).
+// Same 13-bit rank-bitmask → [1..7462] rank mapping as hand_eval.cpp.
+// Flush and high-card hands only (pair/straight/etc. computed by formula).
+// ---------------------------------------------------------------------------
+__constant__ static uint16_t c_flush5_ranks[8192];
+__constant__ static uint16_t c_hc5_ranks[8192];
+
+// ---------------------------------------------------------------------------
 // Card encoding conversion: project uses suit-major (card = suit*13 + rank,
 // 0-based), but the Two Plus Two table indexes cards in rank-major
 // (card = rank*4 + suit, 1-based). Identical to hand_eval.cpp's to_rm().
@@ -89,40 +97,110 @@ static __device__ __forceinline__ int sm_to_rm(uint8_t c)
     return (int)(c % 13) * 4 + (int)(c / 13) + 1;
 }
 
-// tangentforks/TwoPlusTwo stores terminal values as packed category/ordinal
-// entries.  Decode them to the standard [1..7462] scale so GPU training uses
-// the same hand-strength ordering and postflop bucketing as the CPU path.
-static __device__ __forceinline__ uint16_t decode_packed_rank_gpu(uint16_t packed)
+// ---------------------------------------------------------------------------
+// The handranks.dat table uses category-encoded values at 7-card terminals:
+//   raw = category * 4096 + within_rank
+//   cat: 1=HC 2=OP 3=TP 4=Trips 5=Str 6=Flush 7=FH 8=Quads 9=SF
+// This decodes to the standard [1, 7462] rank space.
+// ---------------------------------------------------------------------------
+static __device__ __forceinline__ uint16_t convert_raw_rank_gpu(int raw)
 {
-    const uint16_t cat = packed >> 12;
-    const uint16_t ordinal = packed & 0x0FFFu;
-    if (ordinal == 0) return 0;
-    switch (cat) {
-        case 1: return ordinal;
-        case 2: return (uint16_t)(1277 + ordinal);
-        case 3: return (uint16_t)(4137 + ordinal);
-        case 4: return (uint16_t)(4995 + ordinal);
-        case 5: return (uint16_t)(5853 + ordinal);
-        case 6: return (uint16_t)(5863 + ordinal);
-        case 7: return (uint16_t)(7140 + ordinal);
-        case 8: return (uint16_t)(7296 + ordinal);
-        case 9: return (uint16_t)(7452 + ordinal);
-        default: return 0;
+    // base[cat]: cumulative category offset so that base[cat]+within = final rank
+    const int base[10] = { 0, 0, 1277, 4137, 4995, 5853, 5863, 7140, 7296, 7452 };
+    int cat    = raw >> 12;
+    int within = raw & 0xFFF;
+    if (cat < 1 || cat > 9 || within < 1) return 0;
+    return (uint16_t)(base[cat] + within);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone 5-card evaluator (GPU, no table lookups except constant memory).
+// Card encoding: suit-major uint8_t (c = suit*13 + rank, 0-based).
+// Mirrors eval5_standalone in hand_eval.cpp exactly.
+// ---------------------------------------------------------------------------
+static __device__ uint16_t eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
+                                      uint8_t c3, uint8_t c4)
+{
+    int r[5] = { c0%13, c1%13, c2%13, c3%13, c4%13 };
+    int s[5] = { c0/13, c1/13, c2/13, c3/13, c4/13 };
+
+    // Insertion sort descending
+    for (int i = 1; i < 5; i++) {
+        int v = r[i], j = i;
+        while (j > 0 && r[j-1] < v) { r[j] = r[j-1]; j--; }
+        r[j] = v;
     }
+
+    int cnt[13] = {};
+    for (int i = 0; i < 5; i++) cnt[r[i]]++;
+    uint16_t mask = 0;
+    for (int i = 0; i < 5; i++) mask |= (uint16_t)(1 << r[i]);
+
+    bool is_flush = (s[0]==s[1] && s[1]==s[2] && s[2]==s[3] && s[3]==s[4]);
+    bool all_dist = (cnt[r[0]]==1 && cnt[r[1]]==1 && cnt[r[2]]==1
+                  && cnt[r[3]]==1 && cnt[r[4]]==1);
+    bool is_str   = all_dist && (r[0] - r[4] == 4);
+    bool is_wheel = (r[0]==12 && r[1]==3 && r[2]==2 && r[3]==1 && r[4]==0);
+    int str_high  = is_wheel ? 3 : r[0];
+
+    if (is_flush) {
+        if (is_str || is_wheel) return (uint16_t)(7453 + str_high - 3);
+        return c_flush5_ranks[mask];
+    }
+    if (is_str || is_wheel) return (uint16_t)(5854 + str_high - 3);
+
+    int quads = -1, trips = -1, pairs[2] = {-1, -1};
+    int np = 0;
+    for (int rk = 12; rk >= 0; rk--) {
+        if      (cnt[rk] == 4) quads = rk;
+        else if (cnt[rk] == 3) trips = rk;
+        else if (cnt[rk] == 2 && np < 2) pairs[np++] = rk;
+    }
+
+    if (quads >= 0) {
+        int k = -1;
+        for (int i = 0; i < 5; i++) if (r[i] != quads) { k = r[i]; break; }
+        int ak = (k < quads) ? k : k - 1;
+        return (uint16_t)(7296 + quads * 12 + ak + 1);
+    }
+    if (trips >= 0 && pairs[0] >= 0) {
+        int pr = pairs[0];
+        int ap = (pr < trips) ? pr : pr - 1;
+        return (uint16_t)(7140 + trips * 12 + ap + 1);
+    }
+    if (trips >= 0) {
+        int k[2], ki = 0;
+        for (int i = 0; i < 5; i++) if (r[i] != trips) k[ki++] = r[i];
+        if (k[0] < k[1]) { int t = k[0]; k[0] = k[1]; k[1] = t; }
+        int a0 = (k[0] < trips) ? k[0] : k[0]-1;
+        int a1 = (k[1] < trips) ? k[1] : k[1]-1;
+        return (uint16_t)(4995 + trips * 66 + a0*(a0-1)/2 + a1 + 1);
+    }
+    if (pairs[0] >= 0 && pairs[1] >= 0) {
+        int p1 = pairs[0], p2 = pairs[1];
+        int k = -1;
+        for (int i = 0; i < 5; i++) if (cnt[r[i]] == 1) { k = r[i]; break; }
+        int ak = (k < p2) ? k : (k < p1) ? k-1 : k-2;
+        return (uint16_t)(4137 + (p1*(p1-1)/2 + p2)*11 + ak + 1);
+    }
+    if (pairs[0] >= 0) {
+        int p = pairs[0];
+        int k[3], ki = 0;
+        for (int i = 0; i < 5; i++) if (r[i] != p) k[ki++] = r[i];
+        if (k[0]<k[1]) { int t=k[0]; k[0]=k[1]; k[1]=t; }
+        if (k[0]<k[2]) { int t=k[0]; k[0]=k[2]; k[2]=t; }
+        if (k[1]<k[2]) { int t=k[1]; k[1]=k[2]; k[2]=t; }
+        int a[3];
+        for (int i = 0; i < 3; i++) a[i] = (k[i] < p) ? k[i] : k[i]-1;
+        return (uint16_t)(1277 + p*220 + a[0]*(a[0]-1)*(a[0]-2)/6
+                          + a[1]*(a[1]-1)/2 + a[2] + 1);
+    }
+    return c_hc5_ranks[mask];
 }
 
-static __device__ __forceinline__ uint16_t
-eval5_gpu(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3, uint8_t c4)
-{
-    int p = __ldg(&g_hr[53 + sm_to_rm(c0)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c4)]));
-}
-
-// Two Plus Two supports sequential 7-card lookup in exactly 7 steps — no
-// brute-force C(7,5)=21 combinations needed.  15× fewer memory transactions.
+// 7-card evaluation: 7 sequential Two Plus Two lookups + category decoding.
+// The table's 7-step path returns a category-encoded value; convert_raw_rank_gpu
+// maps it to standard [1..7462] space for bucket computation and comparison.
 static __device__ __forceinline__ uint16_t
 eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
           uint8_t c3, uint8_t c4, uint8_t c5, uint8_t c6)
@@ -133,20 +211,24 @@ eval7_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
     p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
     p     = __ldg(&g_hr[p  + sm_to_rm(c5)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c6)]));
+    return convert_raw_rank_gpu(__ldg(&g_hr[p + sm_to_rm(c6)]));
 }
 
-// 6-card sequential lookup for turn evaluation (2 hole + 4 community).
+// 6-card evaluation: brute-force C(6,5)=6 calls to eval5_gpu.
+// (6-step sequential path in the table returns a slot pointer, not a rank.)
 static __device__ __forceinline__ uint16_t
 eval6_gpu(uint8_t c0, uint8_t c1, uint8_t c2,
           uint8_t c3, uint8_t c4, uint8_t c5)
 {
-    int p = __ldg(&g_hr[53 + sm_to_rm(c0)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c1)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c2)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c3)]);
-    p     = __ldg(&g_hr[p  + sm_to_rm(c4)]);
-    return decode_packed_rank_gpu((uint16_t)__ldg(&g_hr[p + sm_to_rm(c5)]));
+    uint8_t cs[6] = {c0, c1, c2, c3, c4, c5};
+    uint16_t best = 0;
+    for (int skip = 0; skip < 6; ++skip) {
+        uint8_t h[5]; int k = 0;
+        for (int i = 0; i < 6; ++i) if (i != skip) h[k++] = cs[i];
+        uint16_t r = eval5_gpu(h[0], h[1], h[2], h[3], h[4]);
+        if (r > best) best = r;
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,23 +330,13 @@ static inline int to_rm_host(Card c)
     return (c % 13) * 4 + (c / 13) + 1;
 }
 
-static inline uint16_t decode_packed_rank_host(uint16_t packed)
+static inline int convert_raw_rank_host(int raw)
 {
-    const uint16_t cat = packed >> 12;
-    const uint16_t ordinal = packed & 0x0FFFu;
-    if (ordinal == 0) return 0;
-    switch (cat) {
-        case 1: return ordinal;
-        case 2: return (uint16_t)(1277 + ordinal);
-        case 3: return (uint16_t)(4137 + ordinal);
-        case 4: return (uint16_t)(4995 + ordinal);
-        case 5: return (uint16_t)(5853 + ordinal);
-        case 6: return (uint16_t)(5863 + ordinal);
-        case 7: return (uint16_t)(7140 + ordinal);
-        case 8: return (uint16_t)(7296 + ordinal);
-        case 9: return (uint16_t)(7452 + ordinal);
-        default: return 0;
-    }
+    static const int base[10] = { 0, 0, 1277, 4137, 4995, 5853, 5863, 7140, 7296, 7452 };
+    int cat    = raw >> 12;
+    int within = raw & 0xFFF;
+    if (cat < 1 || cat > 9 || within < 1) return (int)(uint16_t)raw;
+    return base[cat] + within;
 }
 
 static bool validate_hand_table_host(const std::vector<int32_t>& hr, const char* path)
@@ -282,16 +354,16 @@ static bool validate_hand_table_host(const std::vector<int32_t>& hr, const char*
     p = hr[p + to_rm_host(/*Js*/ 48)];
     p = hr[p + to_rm_host(/*Ts*/ 47)];
     p = hr[p + to_rm_host(/*2c*/ 0)];
-    const uint16_t royal = decode_packed_rank_host(
-        (uint16_t)hr[p + to_rm_host(/*3d*/ 14)]);
+    const int raw_royal = hr[p + to_rm_host(/*3d*/ 14)];
+    const int royal = convert_raw_rank_host(raw_royal);
 
     if (royal != 7462) {
         fprintf(stderr,
                 "[train] incompatible handranks table at %s:\n"
-                "        As Ks Qs Js Ts 2c 3d decoded to %u, expected 7462.\n"
-                "        This trainer assumes the classic tangentforks/TwoPlusTwo\n"
-                "        packed HandRanks.dat format decodable to [1..7462].\n",
-                path, (unsigned)royal);
+                "        As Ks Qs Js Ts 2c 3d evaluated to raw=%d decoded=%d, expected 7462.\n"
+                "        Ensure the table was generated by scripts/gen_handranks.py\n"
+                "        (32,487,834 int32 entries, ~130 MB).\n",
+                path, raw_royal, royal);
         return false;
     }
 
@@ -796,9 +868,17 @@ traverse_gpu(ThreadGame& g,
                        : ((vm & (1 << a)) ? 1.0f / __popc((unsigned)vm) : 0.0f);
         }
 
-        // Sample one action; clamp prob to avoid IS explosion on rare actions.
+        // Sample one action from the BF16 strategy table.
         int sampled = sample_action(rng, strategy, info_idx, table_size, vm);
-        float q = fmaxf(strat[sampled], 0.05f);   // IS denominator, floor at 5%
+        // IS denominator: use the BF16 strategy probability for the sampled action
+        // (must match the distribution that was actually sampled — not the raw FP32
+        // regrets, which may differ because d_strategy is only refreshed once per batch).
+        float q_bf16 = __bfloat162float(strategy[sampled * table_size + info_idx]);
+        // If BF16 strategy is stale/zero (unvisited info set), fall back to uniform
+        // over valid actions so q is never 0 (which would blow up the IS correction).
+        float n_valid = (float)__popc((unsigned)vm);
+        float q = fmaxf(q_bf16 > 1e-7f ? q_bf16 : (n_valid > 0.f ? 1.f / n_valid : 1.f),
+                        0.05f);  // hard floor at 5% to bound IS variance
 
         ActionState saved = save_action(g);
         g.n_to_act--;
@@ -1099,6 +1179,22 @@ bool GPUCFRTrainer::load_hand_table(const char* path)
 
     // Point the device-side global pointer to the allocated buffer
     CUDA_CHECK(cudaMemcpyToSymbol(g_hr, &d_hr_table, sizeof(int32_t*)));
+
+    // Upload the eval5 flush/HC lookup tables to GPU constant memory.
+    // These are built by hand_eval_init(); load that first.
+    if (!hand_eval_init(path)) {
+        fprintf(stderr, "[train] WARNING: hand_eval_init failed; eval5 tables not loaded.\n");
+    } else {
+        const uint16_t* flush_ranks = nullptr;
+        const uint16_t* hc_ranks    = nullptr;
+        if (hand_eval_get_eval5_tables(&flush_ranks, &hc_ranks)) {
+            CUDA_CHECK(cudaMemcpyToSymbol(c_flush5_ranks, flush_ranks,
+                                          8192 * sizeof(uint16_t)));
+            CUDA_CHECK(cudaMemcpyToSymbol(c_hc5_ranks, hc_ranks,
+                                          8192 * sizeof(uint16_t)));
+        }
+    }
+
     printf("Hand evaluator loaded: %.1f MB\n", sz / 1e6);
     return true;
 }
@@ -1476,13 +1572,17 @@ bool GPUCFRTrainer::save_checkpoint(const std::string& path) const
                                n * sizeof(float), cudaMemcpyDeviceToHost, transfer_stream_));
     CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
 
-    // Write header
-    uint64_t magic = 0x43465247505500ULL;  // "CFRGPU\0"
-    uint32_t table_size = GPU_TABLE_SIZE;
-    uint32_t num_actions = GPU_NUM_ACTIONS;
-    f.write((char*)&magic,       sizeof(magic));
-    f.write((char*)&table_size,  sizeof(table_size));
-    f.write((char*)&num_actions, sizeof(num_actions));
+    // Write header (V2: includes bucket counts to catch semantic incompatibility)
+    uint64_t magic = CHECKPOINT_MAGIC_V2;
+    uint32_t table_size       = GPU_TABLE_SIZE;
+    uint32_t num_actions      = GPU_NUM_ACTIONS;
+    uint32_t preflop_buckets  = PREFLOP_BUCKETS;
+    uint32_t postflop_buckets = POSTFLOP_BUCKETS;
+    f.write((char*)&magic,            sizeof(magic));
+    f.write((char*)&table_size,       sizeof(table_size));
+    f.write((char*)&num_actions,      sizeof(num_actions));
+    f.write((char*)&preflop_buckets,  sizeof(preflop_buckets));
+    f.write((char*)&postflop_buckets, sizeof(postflop_buckets));
     f.write((char*)host_reg.data(),  n * sizeof(float));
     f.write((char*)host_ssum.data(), n * sizeof(float));
     return (bool)f;
@@ -1493,14 +1593,35 @@ bool GPUCFRTrainer::load_checkpoint(const std::string& path)
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
 
-    uint64_t magic; uint32_t ts, na;
+    uint64_t magic; uint32_t ts, na, pb, ppb;
     f.read((char*)&magic, sizeof(magic));
-    f.read((char*)&ts,    sizeof(ts));
-    f.read((char*)&na,    sizeof(na));
+    if (magic == CHECKPOINT_MAGIC_V1) {
+        fprintf(stderr,
+                "ERROR: checkpoint %s was saved with an older format (V1).\n"
+                "  This build uses PREFLOP_BUCKETS=%d POSTFLOP_BUCKETS=%d — you must retrain from scratch.\n",
+                path.c_str(), PREFLOP_BUCKETS, POSTFLOP_BUCKETS);
+        return false;
+    }
+    if (magic != CHECKPOINT_MAGIC_V2) {
+        fprintf(stderr, "ERROR: checkpoint %s has an unrecognized header magic.\n", path.c_str());
+        return false;
+    }
+    f.read((char*)&ts,  sizeof(ts));
+    f.read((char*)&na,  sizeof(na));
+    f.read((char*)&pb,  sizeof(pb));
+    f.read((char*)&ppb, sizeof(ppb));
     if (ts != GPU_TABLE_SIZE || na != GPU_NUM_ACTIONS) {
         fprintf(stderr,
                 "ERROR: checkpoint %s was saved with table_size=%u num_actions=%u, but this build expects %u and %u.\n",
                 path.c_str(), ts, na, (unsigned)GPU_TABLE_SIZE, (unsigned)GPU_NUM_ACTIONS);
+        return false;
+    }
+    if (pb != (uint32_t)PREFLOP_BUCKETS || ppb != (uint32_t)POSTFLOP_BUCKETS) {
+        fprintf(stderr,
+                "ERROR: checkpoint %s was saved with preflop_buckets=%u postflop_buckets=%u, "
+                "but this build expects %d and %d.\n"
+                "  The bucket abstraction changed — you must retrain from scratch.\n",
+                path.c_str(), pb, ppb, PREFLOP_BUCKETS, POSTFLOP_BUCKETS);
         return false;
     }
 

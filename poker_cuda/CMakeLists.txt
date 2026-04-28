@@ -78,3 +78,29 @@ endif()
 # Separate tool: generate Two Plus Two handranks.dat
 # ---------------------------------------------------------------------------
 add_executable(gen_table tools/gen_lookup_table.cpp)
+
+# ---------------------------------------------------------------------------
+# CPU + GPU unit test binary (Modules 1-4 CPU-only, Module 5 GPU)
+# Shares all sources with poker_cuda except main.cpp → test_main.cpp
+# ---------------------------------------------------------------------------
+add_executable(test_poker
+    src/test_main.cpp
+    src/hand_eval.cpp
+    src/abstraction.cpp
+    src/strategy.cpp
+    src/cfr_gpu.cu
+)
+target_include_directories(test_poker PRIVATE src)
+target_link_libraries(test_poker
+    CUDA::curand
+    CUDA::cudart
+)
+if(MPI_FOUND)
+    target_compile_definitions(test_poker PRIVATE USE_MPI)
+    target_link_libraries(test_poker MPI::MPI_CXX)
+endif()
+if(NCCL_LIB AND NCCL_INCLUDE)
+    target_compile_definitions(test_poker PRIVATE USE_NCCL)
+    target_include_directories(test_poker PRIVATE ${NCCL_INCLUDE})
+    target_link_libraries(test_poker ${NCCL_LIB})
+endif()

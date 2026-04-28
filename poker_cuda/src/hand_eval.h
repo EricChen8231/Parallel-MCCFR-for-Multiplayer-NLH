@@ -34,3 +34,11 @@ void precompute_ranks(const Card* hole_cards,
 
 // Hand category from rank value
 const char* hand_category(uint16_t rank);
+
+// Get pointers to the internal 13-bit-mask → rank lookup tables used by
+// eval5_standalone. Caller can upload these to GPU constant memory.
+// Returns false if hand_eval_init() has not been called yet.
+// Each table has 8192 uint16_t entries (indices 0..8191, only populated for
+// entries whose popcount==5 and that form a valid non-straight flush or HC hand).
+bool hand_eval_get_eval5_tables(const uint16_t** out_flush_ranks,
+                                 const uint16_t** out_hc_ranks);

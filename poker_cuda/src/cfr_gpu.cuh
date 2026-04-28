@@ -12,6 +12,14 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Checkpoint file format magic numbers
+// V1: original format (table_size, num_actions only)
+// V2: adds preflop_buckets and postflop_buckets for semantic compatibility checks
+// ---------------------------------------------------------------------------
+static constexpr uint64_t CHECKPOINT_MAGIC_V1 = 0x43465247505500ULL;
+static constexpr uint64_t CHECKPOINT_MAGIC_V2 = 0x43465247505501ULL;
+
+// ---------------------------------------------------------------------------
 // GPU-side constants
 // ---------------------------------------------------------------------------
 static constexpr int      GPU_NUM_ACTIONS = 8;
